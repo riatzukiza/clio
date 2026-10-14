@@ -509,8 +509,14 @@
    value returned; callers canonicalize these snapshots without rereading."
   [directory extra-paths]
   (let [paths (segment-paths directory)
-        extra (read-ledgers extra-paths)]
-    (into extra (map read-segment!) paths)))
+        extra (read-ledgers extra-paths)
+        snapshots (into extra (map read-segment!) paths)]
+    ;; Stale-alias repair may have unlinked a publish temp whose directory
+    ;; force failed; a retry no longer sees that alias, so fence the (real)
+    ;; segment directory once before returning any snapshot.
+    (when-let [first-path (first paths)]
+      (fs/sync-directory! (subs first-path 0 (str/last-index-of first-path "/"))))
+    snapshots))
 
 (defn canonicalize-directory
   "Canonicalize the extra ledger files together with every segment in
