@@ -72,3 +72,16 @@
   (retry-append! runtime
                  {:ledger/path (recovery-path ledger-file)
                   :event (event/make-event (:schema/current runtime) schema-id event-data)}))
+
+(defn canonicalize-directory
+  "Canonicalize extra ledger files plus every segment in `directory`."
+  [runtime directory extra-paths]
+  (canonicalize-files runtime (into (vec extra-paths) (ledger/segment-paths directory))))
+
+(defn append-segment!
+  "Create one event and write it as its own segment file in `directory`.
+   Failures carry :clio/append-recovery for `retry-append!` like `append!`."
+  [runtime directory schema-id event-data]
+  (let [event (event/make-event (:schema/current runtime) schema-id event-data)
+        path (ledger/ensure-segment-file! directory (:event/id event))]
+    (retry-append! runtime {:ledger/path (recovery-path path) :event event})))

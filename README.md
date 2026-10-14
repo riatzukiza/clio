@@ -36,6 +36,28 @@ uses `[stream-id, stream-seq, event-id]` only as a deterministic replay tie-brea
 for graph-incomparable events; domain code must not mistake that tie-break for a
 causal claim.
 
+## Segment directories
+
+A ledger may also be stored as a directory of immutable segments, one event per
+file, named `<event-id>.edn`. Because partitioning has no semantic authority,
+a segment directory (optionally unioned with a frozen legacy ledger file)
+canonicalizes exactly like the same events in one file, and branches that each
+add segments merge without textual conflicts.
+
+```bash
+clio append-segment <schema-dir> <catalog.edn> <segment-dir> <:schema/id> '<event-edn>'
+clio canonicalize-dir <schema-dir> <segment-dir> [legacy-ledger.edn ...]
+```
+
+`clio.infra.ledger/segment-paths`, `create-segment!` and
+`canonicalize-directory` (plus `clio.infra.runtime/append-segment!` and
+`canonicalize-directory`) are the library surface. An exact retry is
+`:already-present`; different data under an existing id is an `:id-collision`;
+a missing directory is an error, never an empty history. Canonical order is
+still the causal/stream order above. Clio does not consult git: checking that
+committed segments were never edited or removed belongs to the caller (eta-mu's
+receipt/ledger commands).
+
 ## Event shape
 
 There is deliberately no hand-maintained `:event/version` integer.

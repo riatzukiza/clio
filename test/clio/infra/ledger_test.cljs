@@ -308,3 +308,70 @@
         (is (= "" (fs/read-text ledger-file))))
       (finally
         (fs/remove-tree! directory)))))
+
+(deftest segment-directories-canonicalize-like-one-ledger
+  (let [directory (str "/tmp/clio-segments-" (host/random-uuid))
+        schema-directory (str directory "/schemas")
+        single-file (str directory "/events.edn")
+        legacy-file (str directory "/legacy.edn")
+        segments (str directory "/segments")]
+    (try
+      (fs/ensure-dir! directory)
+      (ledger/create-ledger! single-file)
+      (ledger/create-ledger! legacy-file)
+      (let [rt (runtime/open schema-directory catalog)
+            opened (:event (runtime/append!
+                            rt single-file :counter/opened
+                            {:event/stream "counter:a" :event/seq 1
+                             :event/actor "user:alice" :event/subject "counter:a"
+                             :event/data {:amount 10}}))
+            added (:event (runtime/append!
+                           rt single-file :counter/added
+                           {:event/stream "counter:a" :event/seq 2
+                            :event/causes [(:event/id opened)]
+                            :event/actor "user:alice" :event/subject "counter:a"
+                            :event/data {:amount 5}}))
+            revisions (:schema/revisions (runtime/refresh rt))
+            whole (ledger/canonicalize-files revisions [single-file])]
+        (testing "a missing segment directory is an error, not an empty history"
+          (is (= :clio.ledger/missing-directory
+                 (error-code #(ledger/segment-paths segments)))))
+        (testing "each event becomes its own content-addressed segment"
+          (is (= :appended (ledger/create-segment! revisions segments added)))
+          (is (= :appended (ledger/create-segment! revisions segments opened)))
+          (is (= :already-present (ledger/create-segment! revisions segments opened)))
+          (is (= (sort [(ledger/segment-path segments (:event/id opened))
+                        (ledger/segment-path segments (:event/id added))])
+                 (ledger/segment-paths segments))))
+        (testing "a different event under an existing id collides"
+          (is (= :clio.ledger/id-collision
+                 (error-code #(ledger/create-segment!
+                               revisions segments
+                               (assoc-in opened [:event/data :amount] 11))))))
+        (testing "segment ids cannot escape the directory"
+          (is (= :clio.ledger/invalid-segment-id
+                 (error-code #(ledger/segment-path segments "../x")))))
+        (testing "segments canonicalize exactly like the single-file ledger"
+          (is (= (:canonical/events whole)
+                 (:canonical/events (ledger/canonicalize-directory revisions segments []))))
+          (is (= (:canonical/events whole)
+                 (:canonical/events (runtime/canonicalize-directory rt segments [])))))
+        (testing "a frozen legacy ledger is unioned as one more partition"
+          (fs/remove-tree! segments)
+          (ledger/append-event! revisions legacy-file opened)
+          (ledger/create-segment! revisions segments added)
+          (is (= (:canonical/events whole)
+                 (:canonical/events
+                  (ledger/canonicalize-directory revisions segments [legacy-file])))))
+        (testing "runtime append-segment writes a new segment"
+          (let [result (runtime/append-segment!
+                        rt segments :counter/added
+                        {:event/stream "counter:a" :event/seq 3
+                         :event/causes [(:event/id added)]
+                         :event/actor "user:alice" :event/subject "counter:a"
+                         :event/data {:amount 1}})]
+            (is (= :appended (:append/result result)))
+            (is (= 3 (count (:canonical/events
+                             (ledger/canonicalize-directory revisions segments [legacy-file]))))))))
+      (finally
+        (fs/remove-tree! directory)))))

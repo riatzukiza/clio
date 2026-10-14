@@ -139,3 +139,65 @@
 (defn canonicalize-files
   [revisions paths]
   (canonicalize/canonicalize revisions (read-ledgers paths)))
+
+;; Segment directories: one immutable ledger file per event. Physical
+;; partitioning carries no semantic authority (law 6), so a directory of
+;; segments canonicalizes exactly like the same events in one file.
+
+(def ^:private segment-suffix ".edn")
+
+(defn- require-directory!
+  [directory]
+  (when-not (fs/exists? directory)
+    (fail! :clio.ledger/missing-directory
+           "Segment directory does not exist"
+           {:path directory})))
+
+(defn segment-path
+  "The content-addressed segment file for one event id inside `directory`."
+  [directory event-id]
+  (when-not (and (string? event-id)
+                 (re-matches #"[0-9A-Za-z][0-9A-Za-z-]*" event-id))
+    (fail! :clio.ledger/invalid-segment-id
+           "Segment event id must be a plain identifier"
+           {:event/id event-id}))
+  (str directory "/" event-id segment-suffix))
+
+(defn segment-paths
+  "Every visible `*.edn` segment in `directory`, sorted only for deterministic
+   reading; order has no meaning. A missing directory is an error, never an
+   empty history."
+  [directory]
+  (require-directory! directory)
+  (->> (fs/list-files directory)
+       (filter #(and (str/ends-with? % segment-suffix)
+                     (not (str/starts-with? % "."))))
+       sort
+       (mapv #(str directory "/" %))))
+
+(defn ensure-segment-file!
+  "Bring the segment file for `event-id` into being exactly once. A concurrent
+   or retried creator that finds it already present is not an error."
+  [directory event-id]
+  (let [path (segment-path directory event-id)]
+    (fs/ensure-dir! directory)
+    (when-not (fs/exists? path)
+      (try
+        (create-ledger! path)
+        (catch #?(:clj Exception :cljs :default) cause
+          (when-not (fs/exists? path) (throw cause)))))
+    path))
+
+(defn create-segment!
+  "Write one validated event as its own segment. The segment is named by the
+   event id, so an exact retry is :already-present and a different event with
+   the same id is an :id-collision; other segments are never touched."
+  [revisions directory event]
+  (schema/validate-event! revisions event)
+  (append-event! revisions (ensure-segment-file! directory (:event/id event)) event))
+
+(defn canonicalize-directory
+  "Canonicalize the extra ledger files (for example a frozen legacy ledger)
+   together with every segment in `directory`."
+  [revisions directory extra-paths]
+  (canonicalize-files revisions (into (vec extra-paths) (segment-paths directory))))
