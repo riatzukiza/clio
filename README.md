@@ -304,6 +304,13 @@ Unsupported hosts or failed directory forces raise
 `:clio.fs/directory-sync-unavailable`; no successful schema publication is
 reported. A force failure after the move can leave the new path present, but
 the caller still receives failure and must not acknowledge dependent events.
+
+JVM segment-entry locks bind their checks to the opened descriptor's inode
+through Linux `/proc/self/fdinfo` and `/proc/self/fd`, without reflection, so
+JVM consumers (including `:local/root` dependencies, which inherit no Clio
+aliases) need no `--add-opens` or other JVM options. A read-only entry open that
+does not complete within `clio.extern.jvm.fs/*entry-open-timeout-ms*` (a FIFO
+swapped in after the type check) fails closed with `:clio.fs/entry-open-blocked`.
 The Node adapter resynchronizes existing ancestry on retry, including directories
 left present by a previously refused force. Tests observe real filesystem calls,
 inject file and directory synchronization failures, and verify that no dependent

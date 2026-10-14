@@ -438,15 +438,14 @@
                                          (fs/delete-if-exists! entry)
                                          (mkfifo! entry))
                                        k)))]
-          (let [result (future (error-code #(ledger/canonicalize-directory revisions segments [])))
+          (let [result (binding [fs/*entry-open-timeout-ms* 500]
+                         (future (error-code #(ledger/canonicalize-directory revisions segments []))))
                 outcome (deref result 15000 ::hung)]
             (when (= ::hung outcome)
               ;; Unblock the reader so the test JVM can exit.
               (with-open [_ (java.io.FileOutputStream. ^String entry)]))
             (is @swapped)
-            (is (contains? #{:clio.fs/entry-open-blocked :clio.fs/entry-replaced
-                             :clio.fs/not-regular-file}
-                           outcome))))
+            (is (= :clio.fs/entry-open-blocked outcome))))
         (fs/delete-if-exists! entry)))))
 
 (deftest jvm-segment-publish-recovery-and-hardlink-guards
