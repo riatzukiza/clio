@@ -396,6 +396,59 @@
             (fs/delete-if-exists! link)))
         (is (= [evt] (:canonical/events (runtime/canonicalize-directory runtime segments []))))))))
 
+(deftest jvm-locks-need-no-consumer-module-opens
+  ;; A :local/root consumer inherits none of Clio's aliases, so ordinary and
+  ;; segment-entry locks must work on a JVM started without --add-opens.
+  (is (not-any? #(str/includes? % "add-opens")
+                (.getInputArguments (java.lang.management.ManagementFactory/getRuntimeMXBean))))
+  (with-ledger
+    (fn [{:keys [directory path runtime]}]
+      (let [segments (str directory "/segments")
+            {evt :event} (runtime/append! runtime path :record/observed fixture/facts)
+            revisions (:schema/revisions (runtime/refresh runtime))]
+        (fs/release-lock! (fs/acquire-read-lock! path))
+        (fs/release-lock! (fs/acquire-lock! path))
+        (fs/ensure-dir! segments)
+        (is (= :appended (ledger/create-segment! revisions segments evt)))
+        (is (= [evt] (:canonical/events
+                      (ledger/canonicalize-directory revisions segments []))))))))
+
+(defn- mkfifo! [path]
+  (let [process (.start (ProcessBuilder. ^java.util.List ["mkfifo" path]))]
+    (when-not (zero? (.waitFor process))
+      (throw (ex-info "mkfifo failed" {:path path})))))
+
+(deftest jvm-fifo-swapped-in-after-the-entry-check-fails-closed
+  (with-ledger
+    (fn [{:keys [directory path runtime]}]
+      (let [segments (str directory "/segments")
+            {evt :event} (runtime/append! runtime path :record/observed fixture/facts)
+            revisions (:schema/revisions (runtime/refresh runtime))
+            entry (ledger/segment-path segments (:event/id evt))
+            file-key @#'fs/file-key
+            swapped (atom false)]
+        (fs/ensure-dir! segments)
+        (is (= :appended (ledger/create-segment! revisions segments evt)))
+        ;; Swap a FIFO in after the regular-file inspection, before the open.
+        (with-redefs [fs/file-key (fn
+                                    ([p] (file-key p))
+                                    ([p links]
+                                     (let [k (file-key p links)]
+                                       (when (and (= p entry) (compare-and-set! swapped false true))
+                                         (fs/delete-if-exists! entry)
+                                         (mkfifo! entry))
+                                       k)))]
+          (let [result (future (error-code #(ledger/canonicalize-directory revisions segments [])))
+                outcome (deref result 15000 ::hung)]
+            (when (= ::hung outcome)
+              ;; Unblock the reader so the test JVM can exit.
+              (with-open [_ (java.io.FileOutputStream. ^String entry)]))
+            (is @swapped)
+            (is (contains? #{:clio.fs/entry-open-blocked :clio.fs/entry-replaced
+                             :clio.fs/not-regular-file}
+                           outcome))))
+        (fs/delete-if-exists! entry)))))
+
 (deftest jvm-segment-publish-recovery-and-hardlink-guards
   (with-ledger
     (fn [{:keys [directory runtime]}]
