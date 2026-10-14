@@ -159,6 +159,21 @@
            "Segment directory does not exist"
            {:path directory})))
 
+(defn- bind-segment-directory!
+  "Resolve `directory` once to its real path after the existence check. Publish,
+   reclaim, and retry paths all use this binding so a symlink retarget during
+   publication cannot split the temp delete and directory fence onto another store."
+  [directory]
+  (require-directory! directory)
+  (try
+    (fs/absolute-path directory)
+    (catch #?(:clj Exception :cljs :default) cause
+      (if (fs/missing-path-error? cause)
+        (fail! :clio.ledger/missing-directory
+               "Segment directory does not exist"
+               {:path directory})
+        (throw cause)))))
+
 (defn- upper-char?
   [ch]
   (let [s (str ch)]
@@ -225,16 +240,9 @@
    an empty history. Case-variant suffixes (`.EDN`, `.Edn`, …) are rejected so
    they cannot silently disappear from canonicalization on case-folding hosts."
   [directory]
-  (require-directory! directory)
   ;; Resolve once: enumeration and every returned path name the same real
   ;; directory, so a symlink retarget after listing cannot mix two stores.
-  (let [directory (try (fs/absolute-path directory)
-                       (catch #?(:clj Exception :cljs :default) cause
-                         (if (fs/missing-path-error? cause)
-                           (fail! :clio.ledger/missing-directory
-                                  "Segment directory does not exist"
-                                  {:path directory})
-                           (throw cause))))
+  (let [directory (bind-segment-directory! directory)
         names (try
                 (fs/list-directory directory)
                 (catch #?(:clj Exception :cljs :default) cause
@@ -411,21 +419,29 @@
                 fs/acquire-entry-lock! tmp false
                 (fn [lock]
                   (append-record! lock "" event)
-                  (try
-                    (fs/hard-link! tmp path)
-                    ;; Drop the temp alias first so the published entry returns to one
-                    ;; link, then persist both directory changes before acknowledging.
-                    ;; A stop inside this window leaves a same-inode temp that the next
-                    ;; segment lock holder removes (see stale-publish-aliases).
-                    (fs/delete-if-exists! tmp)
-                    (fs/sync-directory! directory)
-                    :appended
-                    (catch #?(:clj Exception :cljs :default) cause
-                      (fs/delete-if-exists! tmp)
-                      (cond
-                        (fs/already-exists-error? cause) ::claim-lost
-                        (claim-lost-to-winner? cause path) ::claim-lost
-                        :else (throw cause))))))
+                  (let [published
+                        (try
+                          (fs/hard-link! tmp path)
+                          ;; Drop the temp alias first so the published entry returns to one
+                          ;; link, then persist both directory changes before acknowledging.
+                          ;; A stop inside this window leaves a same-inode temp that the next
+                          ;; segment lock holder removes (see stale-publish-aliases).
+                          (fs/delete-if-exists! tmp)
+                          (fs/sync-directory! directory)
+                          :appended
+                          (catch #?(:clj Exception :cljs :default) cause
+                            (fs/delete-if-exists! tmp)
+                            (cond
+                              (fs/already-exists-error? cause) ::claim-lost
+                              (claim-lost-to-winner? cause path) ::claim-lost
+                              :else (throw cause))))]
+                    ;; A same-user process may have linked the temp after the
+                    ;; one-link check; never acknowledge a multiply linked segment.
+                    (when (and (= :appended published) (not= 1 (fs/locked-link-count lock)))
+                      (fail! :clio.ledger/segment-hardlink
+                             "Segment gained a hard link during publication"
+                             {:path path}))
+                    published)))
               (catch #?(:clj Exception :cljs :default) cause
                 (if (claim-lost-to-winner? cause path)
                   ::claim-lost
@@ -446,11 +462,12 @@
    A brand-new segment is written to a hidden temp and published by exclusive
    hard link under the writer lock, so concurrent canonicalization never sees
    an unlocked empty entry. An exact retry repeats both durability fences
-   before it is acknowledged."
+   before it is acknowledged. The directory is resolved once up front so a
+   symlink retarget cannot split publication across two stores."
   [revisions directory event]
   (schema/validate-event! revisions event)
-  (require-directory! directory)
-  (let [path (segment-path directory (:event/id event))]
+  (let [directory (bind-segment-directory! directory)
+        path (segment-path directory (:event/id event))]
     (refuse-segment-symlink! path)
     (let [outcome
           (if (fs/exists? path)

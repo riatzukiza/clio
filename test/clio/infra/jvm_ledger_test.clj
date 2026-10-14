@@ -535,6 +535,22 @@
           (is (= [evt] (:canonical/events (ledger/canonicalize-directory revisions segments [])))))
         (is (some #(= (fs/absolute-path segments) %) @synced))))))
 
+(deftest jvm-hard-link-added-while-publishing-is-refused
+  (with-ledger
+    (fn [{:keys [directory path runtime]}]
+      (let [segments (str directory "/segments")
+            alias (str directory "/outside-alias")
+            {evt :event} (runtime/append! runtime path :record/observed fixture/facts)
+            revisions (:schema/revisions (runtime/refresh runtime))
+            link! fs/hard-link!]
+        (fs/ensure-dir! segments)
+        ;; Another same-user process links the hidden temp during publication.
+        (with-redefs [fs/hard-link! (fn [from to]
+                                      (when (str/includes? from ".creating-") (link! from alias))
+                                      (link! from to))]
+          (is (= :clio.ledger/segment-hardlink
+                 (error-code #(ledger/create-segment! revisions segments evt)))))))))
+
 (deftest jvm-segment-publish-recovery-and-hardlink-guards
   (with-ledger
     (fn [{:keys [directory runtime]}]
@@ -593,6 +609,40 @@
 
 (defn- creating-entries [segments]
   (filterv #(str/includes? % ".creating-") (fs/list-directory segments)))
+
+(deftest jvm-create-segment-binds-directory-across-symlink-retarget
+  ;; Retarget the directory symlink after hard-link! publishes into store A but
+  ;; before the temp delete / directory fence. Publication must stay on A's real
+  ;; path (resolved once up front), not leave A multiply linked while fencing B.
+  (with-ledger
+    (fn [{:keys [directory path runtime]}]
+      (let [a (str directory "/store-a")
+            b (str directory "/store-b")
+            link (str directory "/segments-link")
+            {evt :event} (runtime/append! runtime path :record/observed fixture/facts)
+            revisions (:schema/revisions (runtime/refresh runtime))
+            nio #(java.nio.file.Paths/get ^String % (make-array String 0))
+            point! (fn [target]
+                     (java.nio.file.Files/deleteIfExists (nio link))
+                     (java.nio.file.Files/createSymbolicLink
+                      (nio link) (nio target)
+                      (make-array java.nio.file.attribute.FileAttribute 0)))
+            link! fs/hard-link!]
+        (fs/ensure-dir! a)
+        (fs/ensure-dir! b)
+        (point! a)
+        (with-redefs [fs/hard-link! (fn [from to]
+                                      (link! from to)
+                                      (point! b))]
+          (is (= :appended (ledger/create-segment! revisions link evt))))
+        (let [seg (ledger/segment-path (fs/absolute-path a) (:event/id evt))]
+          (is (= [evt] (ledger/read-ledger seg)))
+          (is (= 1 (link-count seg)))
+          (is (= [] (creating-entries a)))
+          (is (= [] (fs/list-directory b)))
+          (is (= [evt] (:canonical/events
+                        (ledger/canonicalize-directory revisions a [])))))))))
+
 
 (deftest jvm-interrupted-publish-aliases-are-repaired-under-the-segment-lock
   (with-ledger

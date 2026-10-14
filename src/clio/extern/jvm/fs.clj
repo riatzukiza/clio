@@ -575,6 +575,12 @@
     (sync-directory! (parent-path target-path))
     path))
 
+(defn locked-link-count
+  "Link count of the inode owned by the lock's channel (/proc/self/fd, not a path)."
+  [token]
+  (let [{:keys [^FileChannel channel path]} (lock-entry token)]
+    (fd-link-count (channel-fd-int channel) path)))
+
 (defn sync-locked!
   "Reflush the locked inode and parent, including an uncertain earlier creation."
   [token]

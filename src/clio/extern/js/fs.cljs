@@ -431,6 +431,11 @@
   (sync-directory! (parent-path target-path))
   path)
 
+(defn locked-link-count
+  "Link count of the inode owned by the lock's descriptor (fstat, not a path)."
+  [{:lock/keys [fd]}]
+  (.-nlink (fs/fstatSync fd)))
+
 (defn sync-locked!
   "Reflush the locked inode and parent, including an uncertain earlier creation."
   [{:lock/keys [fd path target-path]}]
