@@ -363,6 +363,42 @@
   ([path] (acquire-entry-lock! path nil))
   ([path options] (acquire-lock-mode! path false true options)))
 
+(defn- try-fcntl-exclusive!
+  "Non-blocking exclusive whole-file fcntl. Returns true when acquired."
+  [fd]
+  (try
+    (fs-ext/fcntlSync fd "setlk" (native-constant "F_WRLCK") 0 0)
+    true
+    (catch :default cause
+      (if (#{"EAGAIN" "EACCES" "EWOULDBLOCK"} (.-code cause))
+        false
+        (throw cause)))))
+
+(defn try-acquire-entry-lock!
+  "Non-blocking counterpart of acquire-entry-lock!. Returns nil when the entry
+   is missing, locked by another holder, multiply linked, or unavailable."
+  [path]
+  (try
+    (let [target-path (entry-path path)]
+      (refuse-nofollow-entry-type! path target-path)
+      (refuse-locked-path! target-path)
+      (let [flags (bit-or (.-O_APPEND (.-constants fs)) (.-O_RDWR (.-constants fs)))
+            fd (open-entry! target-path flags true path)]
+        (try
+          (if-not (try-fcntl-exclusive! fd)
+            (do (fs/closeSync fd) nil)
+            (let [st (fs/fstatSync fd)]
+              (if (not= 1 (.-nlink st))
+                (do (fs/closeSync fd) nil)
+                (do (swap! locked-paths assoc target-path
+                           (stat-identity (fs/fstatSync fd #js {:bigint true})))
+                    {:lock/path path :lock/target-path target-path :lock/fd fd}))))
+          (catch :default cause
+            (fs/closeSync fd)
+            (throw cause)))))
+    (catch :default _
+      nil)))
+
 (defn acquire-entry-read-lock!
   "Shared-lock counterpart of acquire-entry-lock!, with the same `:stale-aliases`."
   ([path] (acquire-entry-read-lock! path nil))

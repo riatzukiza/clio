@@ -326,6 +326,43 @@
   ([path] (acquire-entry-lock! path nil))
   ([path options] (acquire-lock-mode! path false true options)))
 
+(defn try-acquire-entry-lock!
+  "Non-blocking counterpart of acquire-entry-lock!. Returns nil when the entry
+   is missing, locked by another holder, multiply linked, or unavailable."
+  [path]
+  (.lock process-guard)
+  (try
+    (let [target-path (entry-path path)
+          links nofollow-links]
+      (when (Files/exists (nio-path target-path) nofollow-links)
+        (let [key (file-key target-path links)]
+          (when-not (some #(= key (:file/key %)) (vals @active-locks))
+            (let [options (into-array OpenOption [StandardOpenOption/READ
+                                                  StandardOpenOption/WRITE
+                                                  LinkOption/NOFOLLOW_LINKS])
+                  channel (FileChannel/open (nio-path target-path) options)]
+              (try
+                (let [lock (.tryLock channel 0 Long/MAX_VALUE false)]
+                  (if (nil? lock)
+                    (do (.close channel) nil)
+                    (if (not= 1 (link-count path target-path links))
+                      (do (.release lock) (.close channel) nil)
+                      (let [token (str (UUID/randomUUID))]
+                        (swap! active-locks assoc token
+                               {:channel channel :file-lock lock :file/key key
+                                :path path :target-path target-path})
+                        {:lock/id token :lock/path path}))))
+                (catch Throwable cause
+                  (.close channel)
+                  (throw cause))))))))
+    (catch Exception _
+      nil)
+    (finally
+      ;; release-lock! unlocks process-guard; if we return a lock, keep it held.
+      (let [held (some (fn [[_ v]] (= path (:path v))) @active-locks)]
+        (when-not held
+          (.unlock process-guard))))))
+
 (defn acquire-entry-read-lock!
   "Shared-lock counterpart of acquire-entry-lock!, with the same `:stale-aliases`."
   ([path] (acquire-entry-read-lock! path nil))
