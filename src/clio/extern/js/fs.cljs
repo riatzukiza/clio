@@ -227,14 +227,27 @@
   (.join node-path (absolute-path (.dirname node-path path)) (.basename node-path path)))
 
 (defn- open-entry!
+  "Open `target-path`. When `nofollow?`, combine O_NOFOLLOW with O_NONBLOCK so a
+   FIFO/socket swapped in after the lstat type check cannot block the reader
+   indefinitely before the descriptor type guard runs."
   [target-path flags nofollow? path]
   (try
-    (.openSync fs target-path (if nofollow? (bit-or flags (.-O_NOFOLLOW (.-constants fs))) flags))
+    (let [constants (.-constants fs)
+          open-flags (cond-> flags
+                       nofollow? (bit-or (.-O_NOFOLLOW constants)
+                                         (.-O_NONBLOCK constants)))]
+      (.openSync fs target-path open-flags))
     (catch :default cause
-      (if (and nofollow? (= "ELOOP" (.-code cause)))
+      (cond
+        (and nofollow? (= "ELOOP" (.-code cause)))
         (throw (ex-info "Directory entry is a symbolic link"
                         {:path path :clio/error :clio.fs/symlink-entry} cause))
-        (throw cause)))))
+
+        (and nofollow? (#{"ENXIO" "EOPNOTSUPP"} (.-code cause)))
+        (throw (ex-info "Directory entry is not a regular file"
+                        {:path path :clio/error :clio.fs/not-regular-file} cause))
+
+        :else (throw cause)))))
 
 (defn- refuse-nofollow-entry-type!
   "lstat the directory entry before any open. A FIFO/socket open with O_RDONLY

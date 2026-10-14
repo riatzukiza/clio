@@ -91,16 +91,28 @@
         revisions (:schema/revisions (refresh runtime))]
     (canonicalize/canonicalize revisions snapshots)))
 
+(defn- recovery-directory
+  "Anchor recovery to the directory's real path when it exists, so a symlink
+   retarget before retry-append! cannot redirect the write. Fall back to an
+   absolute-lexical spelling only when resolution fails (for example the
+   directory vanished between the caller check and recovery construction)."
+  [directory]
+  (try
+    (fs/absolute-path directory)
+    (catch #?(:clj Exception :cljs :default) _
+      (fs/absolute-lexical-path directory))))
+
 (defn append-segment!
   "Create one event and write it as its own segment file in `directory`.
    Failures carry :clio/append-recovery for `retry-append!` like `append!`; the
    recovery names the segment directory, so a retry keeps segment-only admission.
    Segment setup (missing directory, rejected symlink/hard link, and similar)
    runs inside the recovery-wrapping path so callers always receive the
-   already-generated event. Recovery paths are absolute-lexical so a retry after
-   restart from another working directory still names the original directory."
+   already-generated event. When `directory` exists, recovery uses its real path
+   so a symlink retarget cannot redirect a retry; lexical absolute spelling is
+   reserved for the case where resolution fails."
   [runtime directory schema-id event-data]
-  (let [directory (fs/absolute-lexical-path directory)
+  (let [directory (recovery-directory directory)
         event (event/make-event (:schema/current runtime) schema-id event-data)
         ;; Path is lexical until create-segment! publishes; do not create an
         ;; empty unlocked segment here — that raced with canonicalization.

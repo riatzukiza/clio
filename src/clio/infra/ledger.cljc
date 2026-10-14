@@ -202,25 +202,43 @@
            {:event/id event-id}))
   (str directory "/" (encode-segment-stem event-id) segment-suffix))
 
+(defn- edn-suffix-case-variant?
+  "True when `name` ends with a case-folded `.edn` that is not the canonical
+   lowercase suffix. On a case-insensitive filesystem such an entry aliases the
+   canonical segment path, so enumeration must refuse it rather than omit it."
+  [name]
+  (and (string? name)
+       (>= (count name) (count segment-suffix))
+       (= (str/lower-case (subs name (- (count name) (count segment-suffix))))
+          segment-suffix)
+       (not (str/ends-with? name segment-suffix))))
+
 (defn segment-paths
   "Every visible `*.edn` segment in `directory`, sorted only for deterministic
    reading; order has no meaning. A missing directory — including one that
    disappears between the existence check and enumeration — is an error, never
-   an empty history."
+   an empty history. Case-variant suffixes (`.EDN`, `.Edn`, …) are rejected so
+   they cannot silently disappear from canonicalization on case-folding hosts."
   [directory]
   (require-directory! directory)
-  (->> (try
-         (fs/list-directory directory)
-         (catch #?(:clj Exception :cljs :default) cause
-           (if (fs/missing-path-error? cause)
-             (fail! :clio.ledger/missing-directory
-                    "Segment directory does not exist"
-                    {:path directory})
-             (throw cause))))
-       (filter #(and (str/ends-with? % segment-suffix)
-                     (not (str/starts-with? % "."))))
-       sort
-       (mapv #(str directory "/" %))))
+  (let [names (try
+                (fs/list-directory directory)
+                (catch #?(:clj Exception :cljs :default) cause
+                  (if (fs/missing-path-error? cause)
+                    (fail! :clio.ledger/missing-directory
+                           "Segment directory does not exist"
+                           {:path directory})
+                    (throw cause))))
+        variants (filterv edn-suffix-case-variant? names)]
+    (when (seq variants)
+      (fail! :clio.ledger/noncanonical-segment-suffix
+             "Segment filename must use lowercase .edn suffix"
+             {:path directory :names variants}))
+    (->> names
+         (filter #(and (str/ends-with? % segment-suffix)
+                       (not (str/starts-with? % "."))))
+         sort
+         (mapv #(str directory "/" %)))))
 
 (defn- refuse-segment-symlink!
   [path]

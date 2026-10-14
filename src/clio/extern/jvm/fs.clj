@@ -1,7 +1,8 @@
 (ns clio.extern.jvm.fs
   (:refer-clojure :exclude [exists?])
   (:require [clojure.string :as str])
-  (:import [java.nio ByteBuffer]
+  (:import [java.io FileDescriptor]
+           [java.nio ByteBuffer]
            [java.nio.channels FileChannel FileLock]
            [java.nio.charset StandardCharsets]
            [java.nio.file CopyOption Files LinkOption NoSuchFileException OpenOption Path Paths
@@ -53,6 +54,48 @@
     (or (.fileKey attrs)
         (throw (ex-info "Filesystem does not expose a stable file identity"
                         {:path path :clio/error :clio.fs/unsupported-file-identity}))))))
+
+(defn- channel-fd-int
+  "OS file descriptor number owned by an open FileChannel.
+
+   Requires the JVM opens `--add-opens=java.base/sun.nio.ch=ALL-UNNAMED` and
+   `--add-opens=java.base/java.io=ALL-UNNAMED` (see deps.edn `:test` / `:run`).
+   Without them the identity check fails closed."
+  ^long [^FileChannel channel]
+  (try
+    (let [fd-field (doto (.getDeclaredField (class channel) "fd")
+                     (.setAccessible true))
+          ^FileDescriptor file-fd (.get fd-field channel)
+          val-field (doto (.getDeclaredField FileDescriptor "fd")
+                      (.setAccessible true))]
+      (long (.getInt val-field file-fd)))
+    (catch Exception cause
+      (throw (ex-info (str "Cannot read FileChannel descriptor identity; start the JVM with "
+                           "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED and "
+                           "--add-opens=java.base/java.io=ALL-UNNAMED")
+                      {:clio/error :clio.fs/channel-identity-unavailable}
+                      cause)))))
+
+(defn- channel-file-key
+  "Identity of the inode owned by `channel`, via Linux `/proc/self/fd/<n>`.
+
+   Unlike a path re-stat after open, this cannot be fooled by an ABA rename that
+   restores the original directory entry while the channel still holds a
+   substitute inode."
+  [^FileChannel channel]
+  (file-key (str "/proc/self/fd/" (channel-fd-int channel)) no-links))
+
+(defn- channel-link-count
+  [^FileChannel channel path]
+  (try
+    (long (Files/getAttribute (nio-path (str "/proc/self/fd/" (channel-fd-int channel)))
+                              "unix:nlink"
+                              no-links))
+    (catch Exception cause
+      (throw (ex-info "Filesystem does not expose link count"
+                      {:path path
+                       :clio/error :clio.fs/unsupported-file-identity}
+                      cause)))))
 
 (defn- with-process-guard
   [f]
@@ -270,10 +313,11 @@
                            (throw (ex-info "Directory entry is a symbolic link"
                                            {:path path :clio/error :clio.fs/symlink-entry} cause))
                            (throw cause))))
-          ;; Re-read the directory entry after open. If it was replaced between
-          ;; file-key and open, the path now names a different inode than `key`
-          ;; (the one we intended); refuse rather than locking the substitute.
-          opened-key (try (file-key target-path links)
+          ;; Bind validation to the channel's inode, not a path re-stat. An ABA
+          ;; swap can restore the original directory entry after open while this
+          ;; channel still owns a substitute inode; /proc/self/fd reports the
+          ;; descriptor's identity.
+          opened-key (try (channel-file-key channel)
                           (catch Exception cause
                             (.close channel)
                             (throw cause)))]
@@ -285,17 +329,16 @@
         (let [lock (.lock channel 0 Long/MAX_VALUE (boolean read-only?))
               token (str (UUID/randomUUID))]
           (when nofollow?
-            ;; Link-count and stale-alias repair run only after the entry still
-            ;; names the inspected inode, so they describe the opened file.
-            (when-not (= key (file-key target-path links))
+            ;; Link-count and stale-alias repair describe the opened inode.
+            (when-not (= key (channel-file-key channel))
               (throw (ex-info "Directory entry changed after open"
                               {:path path :clio/error :clio.fs/entry-replaced})))
-            (when (and stale-aliases (< 1 (link-count path target-path links)))
+            (when (and stale-aliases (< 1 (channel-link-count channel path)))
               (repair-stale-aliases! target-path key stale-aliases))
-            (when-not (= key (file-key target-path links))
+            (when-not (= key (channel-file-key channel))
               (throw (ex-info "Directory entry changed during stale-alias repair"
                               {:path path :clio/error :clio.fs/entry-replaced})))
-            (let [nlink (link-count path target-path links)]
+            (let [nlink (channel-link-count channel path)]
               (when-not (= 1 nlink)
                 (throw (ex-info "Directory entry has additional hard links"
                                 {:path path

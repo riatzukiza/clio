@@ -13,4 +13,8 @@
         borkdude/edamame {:mvn/version "1.6.42"}
         funcool/promesa {:mvn/version "11.0.678"}}
  :aliases {:test {:extra-paths ["test" "scripts"]
+                  ;; Channel inode checks read FileChannel's fd via reflection
+                  ;; (see clio.extern.jvm.fs/channel-file-key).
+                  :jvm-opts ["--add-opens=java.base/sun.nio.ch=ALL-UNNAMED"
+                             "--add-opens=java.base/java.io=ALL-UNNAMED"]
                   :main-opts ["-m" "clio.jvm-test-runner"]}}}

@@ -584,7 +584,9 @@
             (is (= :clio.ledger/missing-directory (:clio/error (ex-data cause))))
             (is (map? recovery))
             (is (some? (:event/id (:event recovery))))
-            (is (= missing (:ledger/segment-directory recovery)))))
+            (is (= (fs/absolute-lexical-path missing)
+                   (:ledger/segment-directory recovery))
+                "missing dirs keep absolute-lexical recovery spelling")))
         (testing "a FIFO segment entry fails closed without hanging"
           (let [fifo (ledger/segment-path segments (:event/id other))]
             (observer/mkfifo! fifo)
@@ -792,6 +794,63 @@
           (is (= :appended (ledger/create-segment! revisions segments e-upper)))
           (is (= (:canonical/events (ledger/canonicalize-files revisions [single-file]))
                  (:canonical/events (ledger/canonicalize-directory revisions segments []))))))
+      (finally
+        (fs/remove-tree! directory)))))
+
+(deftest segment-paths-reject-case-variant-edn-suffix
+  (let [directory (str "/tmp/clio-segments-suffix-" (host/random-uuid))
+        schema-directory (str directory "/schemas")
+        segments (str directory "/segments")]
+    (try
+      (fs/ensure-dir! segments)
+      (let [rt (runtime/open schema-directory catalog)
+            revisions (:schema/revisions (runtime/refresh rt))
+            event (event/make-event (:schema/current rt) :counter/opened
+                                    {:event/stream "counter:sfx" :event/seq 1
+                                     :event/actor "user:alice" :event/subject "counter:sfx"
+                                     :event/data {:amount 1}})
+            id (:event/id event)
+            canonical (ledger/segment-path segments id)
+            variant (str segments "/" id ".EDN")]
+        (fs/create-exclusive! variant)
+        (fs/append-text! variant (str (pr-str event) "\n"))
+        (is (= :clio.ledger/noncanonical-segment-suffix
+               (error-code #(ledger/segment-paths segments))))
+        (is (= :clio.ledger/noncanonical-segment-suffix
+               (error-code #(ledger/canonicalize-directory revisions segments []))))
+        (fs/delete-if-exists! variant)
+        (is (= :appended (ledger/create-segment! revisions segments event)))
+        (is (= [canonical] (ledger/segment-paths segments))))
+      (finally
+        (fs/remove-tree! directory)))))
+
+(deftest append-segment-recovery-resolves-existing-directory-symlinks
+  (let [directory (str "/tmp/clio-segments-realsym-" (host/random-uuid))
+        schema-directory (str directory "/schemas")
+        real-segments (str directory "/real-segments")
+        link-segments (str directory "/link-segments")]
+    (try
+      (fs/ensure-dir! real-segments)
+      (observer/symbolic-link! real-segments link-segments)
+      (let [rt (runtime/open schema-directory catalog)
+            facts {:event/stream "counter:sym" :event/seq 1
+                   :event/actor "user:alice" :event/subject "counter:sym"
+                   :event/data {:amount 3}}
+            cause (with-redefs [ledger/create-segment!
+                                (fn [& _]
+                                  (throw (ex-info "injected" {:clio/error :clio.test/injected})))]
+                    (try
+                      (runtime/append-segment! rt link-segments :counter/opened facts)
+                      nil
+                      (catch :default e e)))
+            recovery (:clio/append-recovery (ex-data cause))]
+        (is (= :clio.test/injected (:clio/error (ex-data cause))))
+        (is (map? recovery))
+        (is (= (fs/absolute-path real-segments)
+               (:ledger/segment-directory recovery))
+            "recovery must name the real directory, not the symlink spelling")
+        (is (str/starts-with? (:ledger/path recovery)
+                              (str (fs/absolute-path real-segments) "/"))))
       (finally
         (fs/remove-tree! directory)))))
 
