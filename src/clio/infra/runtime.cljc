@@ -74,14 +74,29 @@
                   :event (event/make-event (:schema/current runtime) schema-id event-data)}))
 
 (defn canonicalize-directory
-  "Canonicalize extra ledger files plus every segment in `directory`."
+  "Canonicalize extra ledger files plus every segment in `directory`. Segment
+   shape is validated while capturing snapshots (empty, multi-event and
+   filename/event-id mismatches fail closed); schema revisions are refreshed
+   after capture, as in canonicalize-files."
   [runtime directory extra-paths]
-  (canonicalize-files runtime (into (vec extra-paths) (ledger/segment-paths directory))))
+  (let [snapshots (ledger/read-directory directory extra-paths)
+        revisions (:schema/revisions (refresh runtime))]
+    (canonicalize/canonicalize revisions snapshots)))
 
 (defn append-segment!
   "Create one event and write it as its own segment file in `directory`.
    Failures carry :clio/append-recovery for `retry-append!` like `append!`."
   [runtime directory schema-id event-data]
   (let [event (event/make-event (:schema/current runtime) schema-id event-data)
-        path (ledger/ensure-segment-file! directory (:event/id event))]
-    (retry-append! runtime {:ledger/path (recovery-path path) :event event})))
+        path (ledger/ensure-segment-file! directory (:event/id event))
+        recovery {:ledger/path (recovery-path path) :event event}]
+    (append-law/validate-recovery! recovery)
+    (try
+      (let [runtime (refresh runtime)]
+        {:append/result (ledger/create-segment! (:schema/revisions runtime) directory event)
+         :event event
+         :runtime runtime})
+      (catch #?(:clj Exception :cljs :default) cause
+        (throw (ex-info (ex-message cause)
+                        (assoc (ex-data cause) :clio/append-recovery recovery)
+                        cause))))))

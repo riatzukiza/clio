@@ -152,6 +152,12 @@
     (vec (fs/readdirSync path))
     []))
 
+(defn list-directory
+  "List entry names in an existing directory. Unlike list-files, a missing or
+   vanished directory throws (see missing-path-error?) instead of reading as empty."
+  [path]
+  (vec (fs/readdirSync path)))
+
 (defn ^:async wait-for-exists!
   [path timeout-ms]
   (let [deadline (+ (js/Date.now) timeout-ms)]
@@ -204,17 +210,37 @@
      0 0 0xffffffff 0xffffffff)
     (acquire-unix-lock! fd read-only?)))
 
+(defn- entry-path
+  "Resolve only the parent directory, keeping the final entry name unresolved so
+   a no-follow open binds to the directory entry itself."
+  [path]
+  (.join node-path (absolute-path (.dirname node-path path)) (.basename node-path path)))
+
+(defn- open-entry!
+  [target-path flags nofollow? path]
+  (try
+    (.openSync fs target-path (if nofollow? (bit-or flags (.-O_NOFOLLOW (.-constants fs))) flags))
+    (catch :default cause
+      (if (and nofollow? (= "ELOOP" (.-code cause)))
+        (throw (ex-info "Directory entry is a symbolic link"
+                        {:path path :clio/error :clio.fs/symlink-entry} cause))
+        (throw cause)))))
+
 (defn- acquire-lock-mode!
-  [path read-only?]
+  [path read-only? nofollow?]
   ;; Bind the resolved target before opening it: a later symlink retarget must
   ;; not move the parent fence away from the inode owned by this descriptor.
-  (let [target-path (absolute-path path)
+  ;; A no-follow open instead binds the named entry and refuses a symlink there.
+  (let [target-path (if nofollow? (entry-path path) (absolute-path path))
         _ (refuse-locked-path! target-path)
         flags (if read-only?
                 (.-O_RDONLY (.-constants fs))
                 (bit-or (.-O_APPEND (.-constants fs)) (.-O_RDWR (.-constants fs))))
-        fd (.openSync fs target-path flags)]
+        fd (open-entry! target-path flags nofollow? path)]
     (try
+      (when (and nofollow? (not (.isFile (fs/fstatSync fd))))
+        (throw (ex-info "Directory entry is not a regular file"
+                        {:path path :clio/error :clio.fs/not-regular-file})))
       (acquire-native-lock! fd read-only?)
       (swap! locked-paths assoc target-path (stat-identity (fs/fstatSync fd #js {:bigint true})))
       {:lock/path path :lock/target-path target-path :lock/fd fd}
@@ -245,7 +271,7 @@
    here and appended to as an empty history. create-ledger! is the only
    creation path; an absent ledger fails with ENOENT."
   [path]
-  (acquire-lock-mode! path false))
+  (acquire-lock-mode! path false false))
 
 (defn acquire-read-lock!
   "Open an existing ledger read-only and hold a shared lock against exclusive writers.
@@ -254,7 +280,19 @@
    Windows uses shared LockFileEx. The same inode guard, owning-descriptor read
    and release operation apply. This never creates storage or upgrades access."
   [path]
-  (acquire-lock-mode! path true))
+  (acquire-lock-mode! path true false))
+
+(defn acquire-entry-lock!
+  "Like acquire-lock!, but open the directory entry with O_NOFOLLOW so the
+   checked entry is the opened inode: a symlink swapped in after a check fails
+   with :clio.fs/symlink-entry instead of redirecting outside the directory."
+  [path]
+  (acquire-lock-mode! path false true))
+
+(defn acquire-entry-read-lock!
+  "Shared-lock counterpart of acquire-entry-lock!."
+  [path]
+  (acquire-lock-mode! path true true))
 
 (defn read-locked-text
   "Read the locked ledger through the same descriptor that owns the lock."

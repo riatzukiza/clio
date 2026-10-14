@@ -165,15 +165,47 @@
 
 (defn segment-paths
   "Every visible `*.edn` segment in `directory`, sorted only for deterministic
-   reading; order has no meaning. A missing directory is an error, never an
-   empty history."
+   reading; order has no meaning. A missing directory — including one that
+   disappears between the existence check and enumeration — is an error, never
+   an empty history."
   [directory]
   (require-directory! directory)
-  (->> (fs/list-files directory)
+  (->> (try
+         (fs/list-directory directory)
+         (catch #?(:clj Exception :cljs :default) cause
+           (if (fs/missing-path-error? cause)
+             (fail! :clio.ledger/missing-directory
+                    "Segment directory does not exist"
+                    {:path directory})
+             (throw cause))))
        (filter #(and (str/ends-with? % segment-suffix)
                      (not (str/starts-with? % "."))))
        sort
        (mapv #(str directory "/" %))))
+
+(defn- refuse-segment-symlink!
+  [path]
+  (when (fs/symlink? path)
+    (fail! :clio.ledger/segment-symlink
+           "Segment entry must not be a symbolic link"
+           {:path path})))
+
+(defn- with-segment-lock
+  "Hold a no-follow lock on the segment entry itself, so the entry that was
+   checked is the inode read or written: a symlink swapped in after any check
+   is refused rather than followed outside the directory."
+  [acquire! path f]
+  (let [lock (try
+               (acquire! path)
+               (catch #?(:clj Exception :cljs :default) cause
+                 (if (= :clio.fs/symlink-entry (:clio/error (ex-data cause)))
+                   (fail! :clio.ledger/segment-symlink
+                          "Segment entry must not be a symbolic link"
+                          {:path path})
+                   (throw cause))))]
+    (try
+      (f lock)
+      (finally (fs/release-lock! lock)))))
 
 (defn ensure-segment-file!
   "Bring the segment file for `event-id` into being exactly once. A concurrent
@@ -183,15 +215,12 @@
   [directory event-id]
   (require-directory! directory)
   (let [path (segment-path directory event-id)]
-    (when (fs/exists? path)
-      (when (fs/symlink? path)
-        (fail! :clio.ledger/segment-symlink
-               "Segment entry must not be a symbolic link"
-               {:path path})))
+    (refuse-segment-symlink! path)
     (when-not (fs/exists? path)
       (try
         (create-ledger! path)
         (catch #?(:clj Exception :cljs :default) cause
+          (refuse-segment-symlink! path)
           (when-not (fs/exists? path) (throw cause)))))
     path))
 
@@ -199,36 +228,46 @@
   "Write one validated event as its own segment. The segment is named by the
    event id, so an exact retry is :already-present and a different event with
    the same id is an :id-collision; other segments are never touched. Unlike
-   ordinary ledger append, a preexisting segment never admits a second event."
+   ordinary ledger append, a preexisting segment never admits a second event.
+   The whole decision runs under one exclusive no-follow lock on the entry, and
+   an exact retry repeats both durability fences before it is acknowledged."
   [revisions directory event]
   (schema/validate-event! revisions event)
-  (let [path (ensure-segment-file! directory (:event/id event))
-        existing (read-existing-ledger! path)]
-    (cond
-      (empty? existing)
-      (append-event! revisions path event)
-      (= 1 (count existing))
-      (if (= (first existing) event)
-        :already-present
-        (fail! :clio.ledger/id-collision
-               "Segment already holds a different event"
-               {:path path :event/id (:event/id event)}))
-      :else
-      (fail! :clio.ledger/multi-event-segment
-             "Segment file must hold exactly one event"
-             {:path path :count (count existing)}))))
+  (let [path (ensure-segment-file! directory (:event/id event))]
+    (with-segment-lock
+      fs/acquire-entry-lock! path
+      (fn [lock]
+        (let [existing-text (fs/read-locked-text lock)
+              existing (parse-ledger-text path existing-text)]
+          (cond
+            (empty? existing)
+            (do (append-record! lock existing-text event) :appended)
 
-(defn- require-segment-file!
-  "Each segment is one non-empty, non-symlink `*.edn` file named by its event id."
-  [_directory path]
-  (when (fs/symlink? path)
-    (fail! :clio.ledger/segment-symlink
-           "Segment entry must not be a symbolic link"
-           {:path path}))
+            (and (= 1 (count existing)) (= (first existing) event))
+            (do (fs/sync-locked! lock) :already-present)
+
+            (= 1 (count existing))
+            (fail! :clio.ledger/id-collision
+                   "Segment already holds a different event"
+                   {:path path :event/id (:event/id event)})
+
+            :else
+            (fail! :clio.ledger/multi-event-segment
+                   "Segment file must hold exactly one event"
+                   {:path path :count (count existing)})))))))
+
+(defn- read-segment!
+  "Capture one segment snapshot through a no-follow shared lock and validate it
+   as one non-empty `*.edn` file holding exactly the event its name declares.
+   The returned snapshot is the one later canonicalized; it is never reread."
+  [path]
+  (refuse-segment-symlink! path)
   (let [name (last (str/split path #"/"))
         expected-id (when (and name (str/ends-with? name segment-suffix))
                       (subs name 0 (- (count name) (count segment-suffix))))
-        events (read-existing-ledger! path)]
+        events (with-segment-lock
+                 fs/acquire-entry-read-lock! path
+                 #(parse-ledger-text path (fs/read-locked-text %)))]
     (when (empty? events)
       (fail! :clio.ledger/empty-segment
              "Segment file is empty (interrupted create?)"
@@ -240,13 +279,21 @@
     (when-not (= expected-id (:event/id (first events)))
       (fail! :clio.ledger/segment-id-mismatch
              "Segment filename must match its event id"
-             {:path path :event/id (:event/id (first events))}))))
+             {:path path :event/id (:event/id (first events))}))
+    events))
+
+(defn read-directory
+  "Capture validated snapshots of the extra ledger files (for example a frozen
+   legacy ledger) and of every segment in `directory`. Each segment snapshot is
+   validated for the one-event-per-`<event-id>.edn` format and is the exact
+   value returned; callers canonicalize these snapshots without rereading."
+  [directory extra-paths]
+  (let [paths (segment-paths directory)
+        extra (read-ledgers extra-paths)]
+    (into extra (map read-segment!) paths)))
 
 (defn canonicalize-directory
-  "Canonicalize the extra ledger files (for example a frozen legacy ledger)
-   together with every segment in `directory`. Each segment is validated for
-   the one-event-per-`<event-id>.edn` format before the ordinary reader runs."
+  "Canonicalize the extra ledger files together with every segment in
+   `directory`, from the validated snapshots captured by read-directory."
   [revisions directory extra-paths]
-  (let [paths (segment-paths directory)]
-    (doseq [path paths] (require-segment-file! directory path))
-    (canonicalize-files revisions (into (vec extra-paths) paths))))
+  (canonicalize/canonicalize revisions (read-directory directory extra-paths)))

@@ -53,7 +53,14 @@ clio canonicalize-dir <schema-dir> <segment-dir> [legacy-ledger.edn ...]
 `canonicalize-directory` (plus `clio.infra.runtime/append-segment!` and
 `canonicalize-directory`) are the library surface. An exact retry is
 `:already-present`; different data under an existing id is an `:id-collision`;
-a missing directory is an error, never an empty history. Canonical order is
+a missing directory (or one that vanishes during enumeration) is an error, never
+an empty history. Both the library and the `canonicalize-dir` command reject an
+empty segment, a multi-event segment, and a filename/event-id mismatch, and
+canonicalize the validated snapshots rather than rereading them. Segment entries
+are opened without following symlinks, so a symlink swapped in after a check is
+refused instead of read or written outside the directory; an exact retry
+repeats the file and directory durability fences before `:already-present`.
+Canonical order is
 still the causal/stream order above. Clio does not consult git: checking that
 committed segments were never edited or removed belongs to the caller (eta-mu's
 receipt/ledger commands).

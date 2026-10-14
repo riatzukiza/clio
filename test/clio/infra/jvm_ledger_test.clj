@@ -356,3 +356,42 @@
         (is (= (:canonical/events (ledger/canonicalize-files revisions [path]))
                (:canonical/events (ledger/canonicalize-directory revisions segments []))
                (:canonical/events (ledger/canonicalize-directory revisions segments [path]))))))))
+
+(deftest jvm-segment-entries-are-bound-validated-and-reflushed
+  (with-ledger
+    (fn [{:keys [directory path runtime]}]
+      (let [segments (str directory "/segments")
+            outside (str directory "/outside.edn")
+            {evt :event} (runtime/append! runtime path :record/observed fixture/facts)
+            revisions (:schema/revisions (runtime/refresh runtime))
+            other (event/make-event (:schema/current runtime) :record/observed
+                                    (assoc fixture/facts :event/stream "record:other"
+                                           :event/subject "record:other"))]
+        (fs/ensure-dir! segments)
+        (is (= :appended (ledger/create-segment! revisions segments evt)))
+        (testing "an identical retry repeats the durability fence"
+          (let [syncs (atom 0) sync! fs/sync-locked!]
+            (with-redefs [fs/sync-locked! (fn [lock] (swap! syncs inc) (sync! lock))]
+              (is (= :already-present (ledger/create-segment! revisions segments evt))))
+            (is (pos? @syncs))))
+        (testing "runtime canonicalize-directory validates segment shape"
+          (let [empty-path (ledger/segment-path segments (:event/id other))]
+            (ledger/create-ledger! empty-path)
+            (is (= :clio.ledger/empty-segment
+                   (error-code #(runtime/canonicalize-directory runtime segments []))))
+            (fs/delete-if-exists! empty-path)))
+        (testing "a symlink swapped in after the check is refused, not followed"
+          (ledger/create-ledger! outside)
+          (let [link (ledger/segment-path segments (:event/id other))]
+            (java.nio.file.Files/createSymbolicLink
+             (java.nio.file.Paths/get link (make-array String 0))
+             (java.nio.file.Paths/get outside (make-array String 0))
+             (make-array java.nio.file.attribute.FileAttribute 0))
+            (with-redefs [fs/symlink? (constantly false)]
+              (is (= :clio.ledger/segment-symlink
+                     (error-code #(ledger/create-segment! revisions segments other))))
+              (is (= "" (fs/read-text outside)))
+              (is (= :clio.ledger/segment-symlink
+                     (error-code #(ledger/canonicalize-directory revisions segments [])))))
+            (fs/delete-if-exists! link)))
+        (is (= [evt] (:canonical/events (runtime/canonicalize-directory runtime segments []))))))))

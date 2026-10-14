@@ -1,5 +1,6 @@
 (ns clio.extern.jvm.fs
   (:refer-clojure :exclude [exists?])
+  (:require [clojure.string :as str])
   (:import [java.nio ByteBuffer]
            [java.nio.channels FileChannel FileLock]
            [java.nio.charset StandardCharsets]
@@ -25,10 +26,14 @@
 (defn missing-path-error? [cause]
   (instance? NoSuchFileException cause))
 
+(def ^:private ^"[Ljava.nio.file.LinkOption;" nofollow-links
+  (into-array LinkOption [LinkOption/NOFOLLOW_LINKS]))
+
 (defn- file-key
-  [path]
+  ([path] (file-key path no-links))
+  ([path ^"[Ljava.nio.file.LinkOption;" link-options]
   (let [p (nio-path path)
-        ^BasicFileAttributes attrs (Files/readAttributes p BasicFileAttributes no-links)]
+        ^BasicFileAttributes attrs (Files/readAttributes p BasicFileAttributes link-options)]
     (when-not (.isRegularFile attrs)
       (throw (ex-info "Ledger path is not a regular file"
                       {:path path :clio/error :clio.fs/not-regular-file})))
@@ -37,7 +42,7 @@
     ;; lock, so an opaque/missing identity must fail closed here.
     (or (.fileKey attrs)
         (throw (ex-info "Filesystem does not expose a stable file identity"
-                        {:path path :clio/error :clio.fs/unsupported-file-identity})))))
+                        {:path path :clio/error :clio.fs/unsupported-file-identity}))))))
 
 (defn- with-process-guard
   [f]
@@ -176,19 +181,54 @@
       (mapv #(str (.getFileName ^Path %)) (iterator-seq (.iterator paths))))
     []))
 
+(defn list-directory
+  "List entry names in an existing directory. Unlike list-files, a missing or
+   vanished directory throws (see missing-path-error?) instead of reading as empty."
+  [path]
+  (with-open [paths (Files/list (nio-path path))]
+    (mapv #(str (.getFileName ^Path %)) (iterator-seq (.iterator paths)))))
+
+(defn- entry-path
+  "Resolve only the parent directory, keeping the final entry name unresolved so
+   a no-follow open binds to the directory entry itself."
+  [path]
+  (let [p (.toAbsolutePath (nio-path path))]
+    (str (.resolve (.toRealPath (.getParent p) no-links) (.getFileName p)))))
+
+(defn- symlink-entry-error? [^Throwable cause]
+  ;; Linux reports O_NOFOLLOW on a symlink as ELOOP.
+  (and (instance? java.nio.file.FileSystemException cause)
+       (some-> (.getReason ^java.nio.file.FileSystemException cause)
+               (str/includes? "symbolic links"))))
+
 (defn- acquire-lock-mode!
-  [path read-only?]
+  [path read-only? nofollow?]
   (.lock process-guard)
   (try
     ;; Resolve before opening so a later symlink retarget cannot redirect the
-    ;; parent fence away from the inode held by this channel.
-    (let [target-path (absolute-path path)
-          _ (refuse-locked-path! target-path)
-          key (file-key target-path)
-          channel (FileChannel/open (nio-path target-path)
-                                    (into-array OpenOption
-                                                (if read-only? [StandardOpenOption/READ]
-                                                    [StandardOpenOption/READ StandardOpenOption/WRITE])))]
+    ;; parent fence away from the inode held by this channel. A no-follow open
+    ;; instead binds the named entry and refuses a symlink there.
+    (let [target-path (if nofollow? (entry-path path) (absolute-path path))
+          links (if nofollow? nofollow-links no-links)
+          key (try (file-key target-path links)
+                   (catch clojure.lang.ExceptionInfo cause
+                     (if (and nofollow? (Files/isSymbolicLink (nio-path target-path)))
+                       (throw (ex-info "Directory entry is a symbolic link"
+                                       {:path path :clio/error :clio.fs/symlink-entry} cause))
+                       (throw cause))))
+          _ (when (some #(= key (:file/key %)) (vals @active-locks))
+              (throw (ex-info "Path is locked by this process; use the owning descriptor"
+                              {:path target-path :clio/error :clio.fs/locked-path-read})))
+          options (cond-> (if read-only? [StandardOpenOption/READ]
+                              [StandardOpenOption/READ StandardOpenOption/WRITE])
+                    nofollow? (conj LinkOption/NOFOLLOW_LINKS))
+          channel (try (FileChannel/open (nio-path target-path)
+                                         ^"[Ljava.nio.file.OpenOption;" (into-array OpenOption options))
+                       (catch Exception cause
+                         (if (and nofollow? (symlink-entry-error? cause))
+                           (throw (ex-info "Directory entry is a symbolic link"
+                                           {:path path :clio/error :clio.fs/symlink-entry} cause))
+                           (throw cause))))]
       (try
         (let [lock (.lock channel 0 Long/MAX_VALUE (boolean read-only?))
               token (str (UUID/randomUUID))]
@@ -213,7 +253,7 @@
    ledger operations; separate processes still coordinate per inode in the OS.
    The returned Clojure token carries no host channel or lock object."
   [path]
-  (acquire-lock-mode! path false))
+  (acquire-lock-mode! path false false))
 
 (defn acquire-read-lock!
   "Hold a shared whole-file lock using a genuinely read-only FileChannel.
@@ -221,7 +261,19 @@
    Shared readers conflict with Clio's exclusive POSIX writers. They retain the
    same local inode guard and release path, and cannot create or append files."
   [path]
-  (acquire-lock-mode! path true))
+  (acquire-lock-mode! path true false))
+
+(defn acquire-entry-lock!
+  "Like acquire-lock!, but open the directory entry with NOFOLLOW_LINKS so the
+   checked entry is the opened inode: a symlink swapped in after a check fails
+   with :clio.fs/symlink-entry instead of redirecting outside the directory."
+  [path]
+  (acquire-lock-mode! path false true))
+
+(defn acquire-entry-read-lock!
+  "Shared-lock counterpart of acquire-entry-lock!."
+  [path]
+  (acquire-lock-mode! path true true))
 
 (defn- lock-entry [token]
   (or (get @active-locks (:lock/id token))

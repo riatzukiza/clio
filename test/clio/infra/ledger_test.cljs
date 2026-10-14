@@ -1,6 +1,7 @@
 (ns clio.infra.ledger-test
   (:require [cljs.test :refer [async deftest is testing]]
             [clio.extern.js.fs :as fs]
+            [clio.extern.js.fs-observer :as observer]
             [clio.extern.js.process :as process]
             [clio.extern.js.runtime :as host]
             [clio.infra.event :as event]
@@ -377,5 +378,82 @@
             (is (= :appended (:append/result result)))
             (is (= 3 (count (:canonical/events
                              (ledger/canonicalize-directory revisions segments [legacy-file]))))))))
+      (finally
+        (fs/remove-tree! directory)))))
+
+(deftest segment-directories-fail-closed-and-bind-checked-entries
+  (let [directory (str "/tmp/clio-segments-guard-" (host/random-uuid))
+        schema-directory (str directory "/schemas")
+        segments (str directory "/segments")
+        outside (str directory "/outside.edn")]
+    (try
+      (fs/ensure-dir! directory)
+      (fs/ensure-dir! segments)
+      (let [rt (runtime/open schema-directory catalog)
+            revisions (:schema/revisions (runtime/refresh rt))
+            make (fn [stream amount]
+                   (event/make-event (:schema/current rt) :counter/opened
+                                     {:event/stream stream :event/seq 1
+                                      :event/actor "user:alice" :event/subject stream
+                                      :event/data {:amount amount}}))
+            opened (make "counter:a" 1)
+            other (make "counter:b" 2)]
+        (testing "an identical retry reflushes under the exclusive lock before acknowledging"
+          (is (= :appended (ledger/create-segment! revisions segments opened)))
+          (let [syncs (atom 0)
+                sync! fs/sync-locked!]
+            (with-redefs [fs/sync-locked! (fn [lock] (swap! syncs inc) (sync! lock))]
+              (is (= :already-present (ledger/create-segment! revisions segments opened))))
+            (is (pos? @syncs) "retry must repeat the durability fence")))
+        (testing "the runtime canonicalize-dir path validates segment shape"
+          (let [empty-path (ledger/segment-path segments (:event/id other))]
+            (ledger/create-ledger! empty-path)
+            (is (= :clio.ledger/empty-segment
+                   (error-code #(runtime/canonicalize-directory rt segments []))))
+            (fs/delete-if-exists! empty-path))
+          (let [mismatch (str segments "/0000-mismatch.edn")]
+            (ledger/create-ledger! mismatch)
+            (ledger/append-event! revisions mismatch other)
+            (is (= :clio.ledger/segment-id-mismatch
+                   (error-code #(runtime/canonicalize-directory rt segments []))))
+            (fs/delete-if-exists! mismatch)))
+        (testing "a segment that becomes a symlink after the check is not followed"
+          (ledger/create-ledger! outside)
+          (let [link (ledger/segment-path segments (:event/id other))]
+            (observer/symbolic-link! outside link)
+            (with-redefs [fs/symlink? (constantly false)]
+              (is (= :clio.ledger/segment-symlink
+                     (error-code #(ledger/create-segment! revisions segments other))))
+              (is (= "" (fs/read-text outside)) "append must not write outside the directory")
+              (ledger/append-event! revisions outside other)
+              (is (= :clio.ledger/segment-symlink
+                     (error-code #(ledger/canonicalize-directory revisions segments [])))))
+            (fs/delete-if-exists! link)))
+        (testing "a directory that disappears during enumeration is an error"
+          (let [vanishing (str directory "/vanishing")
+                exists! fs/exists?
+                remove! fs/remove-tree!
+                removed? (atom false)]
+            (fs/ensure-dir! vanishing)
+            ;; The directory is deleted immediately after its existence check.
+            (with-redefs [fs/exists? (fn [path]
+                                       (let [present (exists! path)]
+                                         (when (and present (= path vanishing)
+                                                    (compare-and-set! removed? false true))
+                                           (remove! vanishing))
+                                         present))]
+              (is (= :clio.ledger/missing-directory
+                     (error-code #(ledger/segment-paths vanishing)))))))
+        (testing "canonicalization consumes the validated snapshots, not a reread"
+          (let [path (ledger/segment-path segments (:event/id opened))
+                reads (atom 0)
+                read! fs/read-locked-text]
+            (with-redefs [fs/read-locked-text (fn [lock]
+                                                (let [text (read! lock)]
+                                                  (when (= path (:lock/path lock)) (swap! reads inc))
+                                                  text))]
+              (is (= [opened] (:canonical/events
+                               (ledger/canonicalize-directory revisions segments []))))
+              (is (= 1 @reads) "each segment is captured exactly once")))))
       (finally
         (fs/remove-tree! directory)))))
