@@ -269,13 +269,32 @@
                          (if (and nofollow? (symlink-entry-error? cause))
                            (throw (ex-info "Directory entry is a symbolic link"
                                            {:path path :clio/error :clio.fs/symlink-entry} cause))
-                           (throw cause))))]
+                           (throw cause))))
+          ;; Re-read the directory entry after open. If it was replaced between
+          ;; file-key and open, the path now names a different inode than `key`
+          ;; (the one we intended); refuse rather than locking the substitute.
+          opened-key (try (file-key target-path links)
+                          (catch Exception cause
+                            (.close channel)
+                            (throw cause)))]
+      (when-not (= key opened-key)
+        (.close channel)
+        (throw (ex-info "Directory entry changed between inspect and open"
+                        {:path path :clio/error :clio.fs/entry-replaced})))
       (try
         (let [lock (.lock channel 0 Long/MAX_VALUE (boolean read-only?))
               token (str (UUID/randomUUID))]
           (when nofollow?
+            ;; Link-count and stale-alias repair run only after the entry still
+            ;; names the inspected inode, so they describe the opened file.
+            (when-not (= key (file-key target-path links))
+              (throw (ex-info "Directory entry changed after open"
+                              {:path path :clio/error :clio.fs/entry-replaced})))
             (when (and stale-aliases (< 1 (link-count path target-path links)))
               (repair-stale-aliases! target-path key stale-aliases))
+            (when-not (= key (file-key target-path links))
+              (throw (ex-info "Directory entry changed during stale-alias repair"
+                              {:path path :clio/error :clio.fs/entry-replaced})))
             (let [nlink (link-count path target-path links)]
               (when-not (= 1 nlink)
                 (throw (ex-info "Directory entry has additional hard links"

@@ -353,39 +353,58 @@
              "Segment file must hold exactly one event"
              {:path path :count (count existing)}))))
 
+(defn- claim-lost-to-winner?
+  "True when the temp disappeared because a concurrent winner published the
+   final segment and reclaimed our unlocked creating temp."
+  [cause path]
+  (and (fs/missing-path-error? cause) (fs/exists? path)))
+
 (defn- publish-new-segment!
   "Write the event into a hidden temp, then claim the final name with an
    exclusive hard link so readers never observe an unlocked empty segment.
    After the final name is visible, leftover creating temps for this event id
-   are swept so interrupted pre-publish writes cannot accumulate."
+   are swept so interrupted pre-publish writes cannot accumulate.
+
+   The temp is locked immediately after creation. If a concurrent winner
+   reclaims it in the tiny create→lock window (or the hard-link races), and
+   the final segment exists, the result is ::claim-lost so create-segment!
+   admits through the final path instead of surfacing a raw ENOENT."
   [directory path event]
   (let [tmp (publish-temp-path directory (:event/id event))]
     (try
       (create-ledger! tmp)
       (let [outcome
-            (with-segment-lock
-              fs/acquire-entry-lock! tmp false
-              (fn [lock]
-                (append-record! lock "" event)
-                (try
-                  (fs/hard-link! tmp path)
-                  ;; Drop the temp alias first so the published entry returns to one
-                  ;; link, then persist both directory changes before acknowledging.
-                  ;; A stop inside this window leaves a same-inode temp that the next
-                  ;; segment lock holder removes (see stale-publish-aliases).
-                  (fs/delete-if-exists! tmp)
-                  (fs/sync-directory! directory)
-                  :appended
-                  (catch #?(:clj Exception :cljs :default) cause
+            (try
+              (with-segment-lock
+                fs/acquire-entry-lock! tmp false
+                (fn [lock]
+                  (append-record! lock "" event)
+                  (try
+                    (fs/hard-link! tmp path)
+                    ;; Drop the temp alias first so the published entry returns to one
+                    ;; link, then persist both directory changes before acknowledging.
+                    ;; A stop inside this window leaves a same-inode temp that the next
+                    ;; segment lock holder removes (see stale-publish-aliases).
                     (fs/delete-if-exists! tmp)
-                    (if (fs/already-exists-error? cause)
-                      ::claim-lost
-                      (throw cause))))))]
+                    (fs/sync-directory! directory)
+                    :appended
+                    (catch #?(:clj Exception :cljs :default) cause
+                      (fs/delete-if-exists! tmp)
+                      (cond
+                        (fs/already-exists-error? cause) ::claim-lost
+                        (claim-lost-to-winner? cause path) ::claim-lost
+                        :else (throw cause))))))
+              (catch #?(:clj Exception :cljs :default) cause
+                (if (claim-lost-to-winner? cause path)
+                  ::claim-lost
+                  (throw cause))))]
         (reclaim-unpublished-temps! directory (:event/id event))
         outcome)
       (catch #?(:clj Exception :cljs :default) cause
         (fs/delete-if-exists! tmp)
-        (throw cause)))))
+        (if (claim-lost-to-winner? cause path)
+          ::claim-lost
+          (throw cause))))))
 
 (defn create-segment!
   "Write one validated event as its own segment. The segment is named by the
