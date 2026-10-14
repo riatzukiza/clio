@@ -149,6 +149,11 @@
 
 (defn- require-directory!
   [directory]
+  ;; An empty spelling would resolve to the process working directory.
+  (when (or (not (string? directory)) (str/blank? directory))
+    (fail! :clio.ledger/empty-directory-path
+           "Segment directory path must not be empty"
+           {:path directory}))
   (when-not (fs/exists? directory)
     (fail! :clio.ledger/missing-directory
            "Segment directory does not exist"
@@ -221,7 +226,16 @@
    they cannot silently disappear from canonicalization on case-folding hosts."
   [directory]
   (require-directory! directory)
-  (let [names (try
+  ;; Resolve once: enumeration and every returned path name the same real
+  ;; directory, so a symlink retarget after listing cannot mix two stores.
+  (let [directory (try (fs/absolute-path directory)
+                       (catch #?(:clj Exception :cljs :default) cause
+                         (if (fs/missing-path-error? cause)
+                           (fail! :clio.ledger/missing-directory
+                                  "Segment directory does not exist"
+                                  {:path directory})
+                           (throw cause))))
+        names (try
                 (fs/list-directory directory)
                 (catch #?(:clj Exception :cljs :default) cause
                   (if (fs/missing-path-error? cause)

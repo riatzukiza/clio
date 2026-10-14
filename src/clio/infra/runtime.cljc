@@ -8,7 +8,8 @@
             [clio.infra.event :as event]
             [clio.infra.ledger :as ledger]
             [clio.infra.schema-store :as schema-store]
-            [clio.law.append :as append-law]))
+            [clio.law.append :as append-law]
+            [clojure.string :as str]))
 
 (defn open
   "Materialize the current source catalog, persist it if it is new, and load all
@@ -112,6 +113,11 @@
    so a symlink retarget cannot redirect a retry; lexical absolute spelling is
    reserved for the case where resolution fails."
   [runtime directory schema-id event-data]
+  ;; Refuse before any event exists: resolving "" would name the working
+  ;; directory, and there is nothing to recover yet.
+  (when (or (not (string? directory)) (str/blank? directory))
+    (throw (ex-info "Segment directory path must not be empty"
+                    {:clio/error :clio.ledger/empty-directory-path :path directory})))
   (let [directory (recovery-directory directory)
         event (event/make-event (:schema/current runtime) schema-id event-data)
         ;; Path is lexical until create-segment! publishes; do not create an
