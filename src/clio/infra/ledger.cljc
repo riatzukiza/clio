@@ -3,6 +3,7 @@
             [clio.domain.schema :as schema]
             #?(:clj [clio.extern.jvm.fs :as fs]
                :cljs [clio.extern.js.fs :as fs])
+            [clio.law.event :as event-law]
             [clio.law.ledger :as ledger-law]
             [clio.shape.edn :as edn]
             [clojure.string :as str]))
@@ -154,10 +155,13 @@
            {:path directory})))
 
 (defn segment-path
-  "The content-addressed segment file for one event id inside `directory`."
+  "The content-addressed segment file for one event id inside `directory`.
+   The filename rule is the event identity law itself (`clio.law.event/uuid-string?`,
+   enforced by `schema/validate-event!` for every ledger), so the segment format
+   admits exactly the ids an ordinary ledger admits, and none can escape the
+   directory."
   [directory event-id]
-  (when-not (and (string? event-id)
-                 (re-matches #"[0-9A-Za-z][0-9A-Za-z-]*" event-id))
+  (when-not (event-law/uuid-string? event-id)
     (fail! :clio.ledger/invalid-segment-id
            "Segment event id must be a plain identifier"
            {:event/id event-id}))

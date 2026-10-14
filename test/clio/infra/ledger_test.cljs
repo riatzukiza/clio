@@ -505,3 +505,35 @@
                                      :event candidate})))))))
       (finally
         (fs/remove-tree! directory)))))
+
+(deftest segment-names-accept-exactly-the-admissible-event-ids
+  (let [directory (str "/tmp/clio-segments-ids-" (host/random-uuid))
+        schema-directory (str directory "/schemas")
+        segments (str directory "/segments")
+        single-file (str directory "/events.edn")]
+    (try
+      (fs/ensure-dir! segments)
+      (ledger/create-ledger! single-file)
+      (let [rt (runtime/open schema-directory catalog)
+            revisions (:schema/revisions (runtime/refresh rt))
+            valid (event/make-event (:schema/current rt) :counter/opened
+                                    {:event/stream "counter:i" :event/seq 1
+                                     :event/actor "user:alice" :event/subject "counter:i"
+                                     :event/data {:amount 1}})
+            ;; 36 characters, so it satisfies the envelope length, but not the identity law.
+            odd (assoc valid :event/id "aaaaaaaa_bbbb_4ccc_8ddd_eeeeeeeeeeee")]
+        (testing "the segment filename rule is the event identity law"
+          (is (string? (ledger/segment-path segments (:event/id valid))))
+          (is (string? (ledger/segment-path segments (str/upper-case (:event/id valid)))))
+          (is (= :clio.ledger/invalid-segment-id
+                 (error-code #(ledger/segment-path segments "not-a-uuid")))))
+        (testing "an id the ordinary ledger refuses is refused the same way as a segment"
+          (is (= :clio.schema/invalid-identity
+                 (error-code #(ledger/append-event! revisions single-file odd))))
+          (is (= :clio.schema/invalid-identity
+                 (error-code #(ledger/create-segment! revisions segments odd)))))
+        (testing "an admissible id is admitted by both representations"
+          (is (= :appended (ledger/append-event! revisions single-file valid)))
+          (is (= :appended (ledger/create-segment! revisions segments valid)))))
+      (finally
+        (fs/remove-tree! directory)))))

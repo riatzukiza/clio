@@ -39,7 +39,8 @@ causal claim.
 ## Segment directories
 
 A ledger may also be stored as a directory of immutable segments, one event per
-file, named `<event-id>.edn`. Because partitioning has no semantic authority,
+file, named `<event-id>.edn`. Segment names follow the event identity law (a
+UUID string), so any event an ordinary ledger admits can be a segment. Because partitioning has no semantic authority,
 a segment directory (optionally unioned with a frozen legacy ledger file)
 canonicalizes exactly like the same events in one file, and branches that each
 add segments merge without textual conflicts.
