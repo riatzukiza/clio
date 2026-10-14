@@ -77,7 +77,11 @@
    position is restored. No JVM module opens are needed, so :local/root
    consumers work unchanged. Without Linux /proc the identity check fails closed."
   ^long [^FileChannel channel]
-  (let [saved (.position channel)
+  (let [saved (try (.position channel)
+                   (catch java.io.IOException cause
+                     ;; ESPIPE: the descriptor is a FIFO/socket, not the inspected file.
+                     (throw (ex-info "Opened entry is not a seekable regular file"
+                                     {:clio/error :clio.fs/entry-replaced} cause))))
         tag (.nextLong (java.util.concurrent.ThreadLocalRandom/current)
                        (bit-shift-left 1 33) (bit-shift-left 1 40))]
     (try
@@ -307,10 +311,18 @@
     (when (seq aliases) (sync-directory! (parent-path target-path)))))
 
 (def ^:dynamic *entry-open-timeout-ms*
-  "Upper bound for opening a checked segment entry read-only. A regular file
-   opens at once; a FIFO swapped in after the type check would block a
-   read-only open (the JVM has no O_NONBLOCK), so the open fails closed."
+  "Upper bound for the read-only fallback open of a checked segment entry. A
+   regular file opens at once; a FIFO swapped in after the type check would
+   block a read-only open (the JVM has no O_NONBLOCK), so the open fails closed."
   5000)
+
+(def ^:dynamic *max-stuck-entry-opens*
+  "Abandoned fallback opens still blocked in the kernel. At this many, further
+   fallback opens refuse at once instead of starting another thread, so a FIFO
+   swap cannot accumulate blocked threads."
+  1)
+
+(def ^:private stuck-entry-opens (atom 0))
 
 (defn- open-entry-bounded!
   "Open `target-path` on a daemon worker and wait at most
@@ -318,6 +330,10 @@
    :clio.fs/entry-open-blocked is thrown. A late channel is closed only under
    process-guard, so no lock this process holds can be dropped by that close."
   ^FileChannel [target-path ^"[Ljava.nio.file.OpenOption;" options path]
+  (when (<= (long *max-stuck-entry-opens*) (long @stuck-entry-opens))
+    (throw (ex-info "An earlier entry open is still blocked; refusing another"
+                    {:path path :clio/error :clio.fs/entry-open-blocked
+                     :stuck-opens @stuck-entry-opens})))
   (let [state (atom ::waiting)
         worker (doto (Thread.
                       ^Runnable
@@ -325,6 +341,7 @@
                         (let [outcome (try {:channel (FileChannel/open (nio-path target-path) options)}
                                            (catch Throwable cause {:error cause}))]
                           (when-not (compare-and-set! state ::waiting outcome)
+                            (swap! stuck-entry-opens dec)
                             (when-let [^FileChannel late (:channel outcome)]
                               (.lock process-guard)
                               (try (.close late) (finally (.unlock process-guard))))))))
@@ -333,10 +350,37 @@
                  (.start))]
     (.join worker (long *entry-open-timeout-ms*))
     (if (compare-and-set! state ::waiting ::abandoned)
-      (throw (ex-info "Directory entry open did not complete; refusing a special-file swap"
-                      {:path path :clio/error :clio.fs/entry-open-blocked}))
+      (do (swap! stuck-entry-opens inc)
+          (throw (ex-info "Directory entry open did not complete; refusing a special-file swap"
+                          {:path path :clio/error :clio.fs/entry-open-blocked})))
       (let [{:keys [channel error]} @state]
         (if error (throw error) channel)))))
+
+(defn- read-only-target-error? [^Throwable cause]
+  (or (instance? java.nio.file.AccessDeniedException cause)
+      (and (instance? java.nio.file.FileSystemException cause)
+           (some-> (.getReason ^java.nio.file.FileSystemException cause)
+                   (str/includes? "Read-only file system")))))
+
+(defn- open-entry-read!
+  "Open a checked entry for a shared lock without blocking on a FIFO swap.
+
+   Linux never blocks an O_RDWR open of a FIFO, so try READ+WRITE first (the
+   lock token stays read-only: append-locked-text! refuses it). Only an entry
+   this process may not write (permissions, read-only filesystem) falls back to
+   a READ open bounded by open-entry-bounded!."
+  ^FileChannel [target-path path]
+  (try
+    (FileChannel/open (nio-path target-path)
+                      ^"[Ljava.nio.file.OpenOption;"
+                      (into-array OpenOption [StandardOpenOption/READ StandardOpenOption/WRITE
+                                              LinkOption/NOFOLLOW_LINKS]))
+    (catch Exception cause
+      (if (read-only-target-error? cause)
+        (open-entry-bounded! target-path
+                             (into-array OpenOption [StandardOpenOption/READ LinkOption/NOFOLLOW_LINKS])
+                             path)
+        (throw cause)))))
 
 (defn- acquire-lock-mode!
   [path read-only? nofollow? {:keys [stale-aliases]}]
@@ -362,7 +406,7 @@
           open-options ^"[Ljava.nio.file.OpenOption;" (into-array OpenOption options)
           channel (try (if (and nofollow? read-only?)
                          ;; Read-only opens are the ones a FIFO swap can block.
-                         (open-entry-bounded! target-path open-options path)
+                         (open-entry-read! target-path path)
                          (FileChannel/open (nio-path target-path) open-options))
                        (catch Exception cause
                          (if (and nofollow? (symlink-entry-error? cause))
@@ -409,7 +453,7 @@
                                  :clio/error :clio.fs/multiply-linked-entry})))))
           (swap! active-locks assoc token
                  {:channel channel :file-lock lock :file/key key
-                  :path path :target-path target-path})
+                  :path path :target-path target-path :read-only? (boolean read-only?)})
           {:lock/id token :lock/path path})
         (catch Throwable cause
           (.close channel)
@@ -517,7 +561,10 @@
 (defn append-locked-text!
   "Append and force the owning inode, then its directory entry, before acknowledgment."
   [token text]
-  (let [{:keys [^FileChannel channel path target-path]} (lock-entry token)]
+  (let [{:keys [^FileChannel channel path target-path read-only?]} (lock-entry token)]
+    ;; A shared entry lock may own a READ+WRITE channel (FIFO-safe open); it
+    ;; still never writes.
+    (when read-only? (throw (java.nio.channels.NonWritableChannelException.)))
     ;; Refuse an unsupported host before the event becomes visible, as rename!
     ;; checks before moving, so the append fails without writing an event that
     ;; every retry would then report as failed. Transient force failures after

@@ -473,6 +473,9 @@
                         "the second attempt refuses at once instead of waiting")
                     (is (= stuck (entry-open-threads)) "no second blocked opener")))
                 ;; Release the stuck reader; it closes its late channel.
+                (java.nio.file.Files/setPosixFilePermissions
+                 (java.nio.file.Paths/get entry (make-array String 0))
+                 (java.nio.file.attribute.PosixFilePermissions/fromString "rw-r--r--"))
                 (with-open [_ (java.io.FileOutputStream. ^String entry)])
                 (loop [n 0]
                   (when (and (pos? (entry-open-threads)) (< n 100))

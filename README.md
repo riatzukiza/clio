@@ -308,9 +308,13 @@ the caller still receives failure and must not acknowledge dependent events.
 JVM segment-entry locks bind their checks to the opened descriptor's inode
 through Linux `/proc/self/fdinfo` and `/proc/self/fd`, without reflection, so
 JVM consumers (including `:local/root` dependencies, which inherit no Clio
-aliases) need no `--add-opens` or other JVM options. A read-only entry open that
-does not complete within `clio.extern.jvm.fs/*entry-open-timeout-ms*` (a FIFO
-swapped in after the type check) fails closed with `:clio.fs/entry-open-blocked`.
+aliases) need no `--add-opens` or other JVM options. Shared entry locks open
+READ+WRITE (Linux never blocks an `O_RDWR` FIFO open; the token still refuses
+writes), so a FIFO swapped in after the type check is refused at once. Only an
+entry the process cannot write falls back to a READ open bounded by
+`clio.extern.jvm.fs/*entry-open-timeout-ms*`; it fails closed with
+`:clio.fs/entry-open-blocked`, and while `*max-stuck-entry-opens*` abandoned
+opens are still blocked, further fallback opens refuse immediately.
 The Node adapter resynchronizes existing ancestry on retry, including directories
 left present by a previously refused force. Tests observe real filesystem calls,
 inject file and directory synchronization failures, and verify that no dependent
