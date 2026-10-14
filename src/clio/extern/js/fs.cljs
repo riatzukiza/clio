@@ -258,8 +258,36 @@
                        :nlink nlink
                        :clio/error :clio.fs/multiply-linked-entry})))))
 
+(defn- unlink-if-present!
+  [path]
+  (try (fs/unlinkSync path)
+       (catch :default cause
+         (when-not (missing-path-error? cause) (throw cause)))))
+
+(defn- same-inode-entry?
+  "lstat `candidate` without following links: true when it is a regular file
+   naming the inode `identity`. A candidate that vanished is not an alias."
+  [candidate identity]
+  (try
+    (let [st (fs/lstatSync candidate #js {:bigint true})]
+      (and (.isFile st) (= identity (stat-identity st))))
+    (catch :default cause
+      (if (missing-path-error? cause) false (throw cause)))))
+
+(defn- repair-stale-aliases!
+  "With the inode lock held and more than one link observed, unlink each
+   caller-named candidate entry that is this same inode, then force the parent
+   directory. The caller names only entries whose owner must hold this lock
+   while they exist, so a lock holder that still sees them knows the owner is
+   gone. Anything else keeps its link and the link-count guard still refuses."
+  [target-path fd stale-aliases]
+  (let [identity (stat-identity (fs/fstatSync fd #js {:bigint true}))
+        aliases (filterv #(same-inode-entry? % identity) (stale-aliases))]
+    (doseq [alias aliases] (unlink-if-present! alias))
+    (when (seq aliases) (sync-directory! (parent-path target-path)))))
+
 (defn- acquire-lock-mode!
-  [path read-only? nofollow?]
+  [path read-only? nofollow? {:keys [stale-aliases]}]
   ;; Bind the resolved target before opening it: a later symlink retarget must
   ;; not move the parent fence away from the inode owned by this descriptor.
   ;; A no-follow open instead binds the named entry and refuses a symlink there.
@@ -272,6 +300,8 @@
         fd (open-entry! target-path flags nofollow? path)]
     (try
       (acquire-native-lock! fd read-only?)
+      (when (and nofollow? stale-aliases (< 1 (.-nlink (fs/fstatSync fd))))
+        (repair-stale-aliases! target-path fd stale-aliases))
       (when nofollow? (refuse-multiply-linked-fd! path fd))
       (swap! locked-paths assoc target-path (stat-identity (fs/fstatSync fd #js {:bigint true})))
       {:lock/path path :lock/target-path target-path :lock/fd fd}
@@ -302,7 +332,7 @@
    here and appended to as an empty history. create-ledger! is the only
    creation path; an absent ledger fails with ENOENT."
   [path]
-  (acquire-lock-mode! path false false))
+  (acquire-lock-mode! path false false nil))
 
 (defn acquire-read-lock!
   "Open an existing ledger read-only and hold a shared lock against exclusive writers.
@@ -311,19 +341,25 @@
    Windows uses shared LockFileEx. The same inode guard, owning-descriptor read
    and release operation apply. This never creates storage or upgrades access."
   [path]
-  (acquire-lock-mode! path true false))
+  (acquire-lock-mode! path true false nil))
 
 (defn acquire-entry-lock!
   "Like acquire-lock!, but open the directory entry with O_NOFOLLOW so the
    checked entry is the opened inode: a symlink swapped in after a check fails
-   with :clio.fs/symlink-entry instead of redirecting outside the directory."
-  [path]
-  (acquire-lock-mode! path false true))
+   with :clio.fs/symlink-entry instead of redirecting outside the directory.
+
+   The entry must have exactly one link once locked. `:stale-aliases`, when
+   given, is a zero-argument function naming candidate entries that may only
+   exist while their owner holds this inode's lock (an interrupted publisher's
+   temp). Under the lock, candidates that are this same inode are unlinked and
+   the directory is forced before the one-link guard runs."
+  ([path] (acquire-entry-lock! path nil))
+  ([path options] (acquire-lock-mode! path false true options)))
 
 (defn acquire-entry-read-lock!
-  "Shared-lock counterpart of acquire-entry-lock!."
-  [path]
-  (acquire-lock-mode! path true true))
+  "Shared-lock counterpart of acquire-entry-lock!, with the same `:stale-aliases`."
+  ([path] (acquire-entry-read-lock! path nil))
+  ([path options] (acquire-lock-mode! path true true options)))
 
 (defn read-locked-text
   "Read the locked ledger through the same descriptor that owns the lock."

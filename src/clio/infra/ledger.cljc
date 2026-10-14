@@ -194,13 +194,38 @@
            "Segment entry must not be a symbolic link"
            {:path path})))
 
+(def ^:private creating-marker ".creating-")
+
+(defn- publish-temp-path
+  [directory event-id]
+  (str directory "/." event-id creating-marker (random-uuid)))
+
+(defn- stale-publish-aliases
+  "Name the hidden publish temps of the segment at `path` (`.<event-id>.creating-*`
+   beside it). A publisher holds the segment inode's exclusive lock from before
+   its hard link until after it deletes its temp, so any lock holder that still
+   finds such a temp naming the same inode knows that publisher stopped in the
+   link-to-unlink window. The fs layer removes only same-inode candidates."
+  [path]
+  (let [slash (str/last-index-of path "/")
+        directory (subs path 0 slash)
+        name (subs path (inc slash))
+        prefix (str "." (subs name 0 (- (count name) (count segment-suffix))) creating-marker)]
+    (fn []
+      (->> (fs/list-directory directory)
+           (filter #(str/starts-with? % prefix))
+           (mapv #(str directory "/" %))))))
+
 (defn- with-segment-lock
   "Hold a no-follow lock on the segment entry itself, so the entry that was
    checked is the inode read or written: a symlink swapped in after any check
-   is refused rather than followed outside the directory."
-  [acquire! path f]
+   is refused rather than followed outside the directory. A published segment
+   (`repair?`) first drops a stale publish temp of its own inode under the lock,
+   so an interrupted publish never leaves it permanently multiply linked; any
+   other extra link is still refused as :clio.ledger/segment-hardlink."
+  [acquire! path repair? f]
   (let [lock (try
-               (acquire! path)
+               (acquire! path (when repair? {:stale-aliases (stale-publish-aliases path)}))
                (catch #?(:clj Exception :cljs :default) cause
                  (case (:clio/error (ex-data cause))
                    :clio.fs/symlink-entry
@@ -264,18 +289,21 @@
   "Write the event into a hidden temp, then claim the final name with an
    exclusive hard link so readers never observe an unlocked empty segment."
   [directory path event]
-  (let [tmp (str directory "/." (:event/id event) ".creating-" (random-uuid))]
+  (let [tmp (publish-temp-path directory (:event/id event))]
     (try
       (create-ledger! tmp)
       (with-segment-lock
-        fs/acquire-entry-lock! tmp
+        fs/acquire-entry-lock! tmp false
         (fn [lock]
           (append-record! lock "" event)
           (try
             (fs/hard-link! tmp path)
-            ;; Persist the published directory entry before acknowledging.
-            (fs/sync-directory! directory)
+            ;; Drop the temp alias first so the published entry returns to one
+            ;; link, then persist both directory changes before acknowledging.
+            ;; A stop inside this window leaves a same-inode temp that the next
+            ;; segment lock holder removes (see stale-publish-aliases).
             (fs/delete-if-exists! tmp)
+            (fs/sync-directory! directory)
             :appended
             (catch #?(:clj Exception :cljs :default) cause
               (fs/delete-if-exists! tmp)
@@ -302,12 +330,12 @@
     (refuse-segment-symlink! path)
     (if (fs/exists? path)
       (with-segment-lock
-        fs/acquire-entry-lock! path
+        fs/acquire-entry-lock! path true
         #(admit-locked-segment! % path event))
       (let [outcome (publish-new-segment! directory path event)]
         (if (= ::claim-lost outcome)
           (with-segment-lock
-            fs/acquire-entry-lock! path
+            fs/acquire-entry-lock! path true
             #(admit-locked-segment! % path event))
           outcome)))))
 
@@ -321,7 +349,7 @@
         expected-id (when (and name (str/ends-with? name segment-suffix))
                       (subs name 0 (- (count name) (count segment-suffix))))
         events (with-segment-lock
-                 fs/acquire-entry-read-lock! path
+                 fs/acquire-entry-read-lock! path true
                  #(parse-ledger-text path (fs/read-locked-text %)))]
     (when (empty? events)
       (fail! :clio.ledger/empty-segment

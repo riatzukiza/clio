@@ -204,8 +204,39 @@
        (some-> (.getReason ^java.nio.file.FileSystemException cause)
                (str/includes? "symbolic links"))))
 
+(defn- link-count
+  [path target-path links]
+  (try (long (Files/getAttribute (nio-path target-path) "unix:nlink" links))
+       (catch Exception cause
+         (throw (ex-info "Filesystem does not expose link count"
+                         {:path path
+                          :clio/error :clio.fs/unsupported-file-identity}
+                         cause)))))
+
+(defn- same-inode-entry?
+  "Read `candidate` without following links: true when it is a regular file
+   with the file identity `key`. A candidate that vanished is not an alias."
+  [candidate key]
+  (try
+    (let [^BasicFileAttributes attrs (Files/readAttributes (nio-path candidate)
+                                                           BasicFileAttributes
+                                                           nofollow-links)]
+      (and (.isRegularFile attrs) (= key (.fileKey attrs))))
+    (catch NoSuchFileException _ false)))
+
+(defn- repair-stale-aliases!
+  "With the inode lock held and more than one link observed, delete each
+   caller-named candidate entry that is this same inode, then force the parent
+   directory. The caller names only entries whose owner must hold this lock
+   while they exist, so a lock holder that still sees them knows the owner is
+   gone. Anything else keeps its link and the link-count guard still refuses."
+  [target-path key stale-aliases]
+  (let [aliases (filterv #(same-inode-entry? % key) (stale-aliases))]
+    (doseq [alias aliases] (Files/deleteIfExists (nio-path alias)))
+    (when (seq aliases) (sync-directory! (parent-path target-path)))))
+
 (defn- acquire-lock-mode!
-  [path read-only? nofollow?]
+  [path read-only? nofollow? {:keys [stale-aliases]}]
   (.lock process-guard)
   (try
     ;; Resolve before opening so a later symlink retarget cannot redirect the
@@ -236,14 +267,9 @@
         (let [lock (.lock channel 0 Long/MAX_VALUE (boolean read-only?))
               token (str (UUID/randomUUID))]
           (when nofollow?
-            (let [nlink (try (long (Files/getAttribute (nio-path target-path)
-                                                       "unix:nlink"
-                                                       links))
-                             (catch Exception cause
-                               (throw (ex-info "Filesystem does not expose link count"
-                                               {:path path
-                                                :clio/error :clio.fs/unsupported-file-identity}
-                                               cause))))]
+            (when (and stale-aliases (< 1 (link-count path target-path links)))
+              (repair-stale-aliases! target-path key stale-aliases))
+            (let [nlink (link-count path target-path links)]
               (when-not (= 1 nlink)
                 (throw (ex-info "Directory entry has additional hard links"
                                 {:path path
@@ -270,7 +296,7 @@
    ledger operations; separate processes still coordinate per inode in the OS.
    The returned Clojure token carries no host channel or lock object."
   [path]
-  (acquire-lock-mode! path false false))
+  (acquire-lock-mode! path false false nil))
 
 (defn acquire-read-lock!
   "Hold a shared whole-file lock using a genuinely read-only FileChannel.
@@ -278,19 +304,25 @@
    Shared readers conflict with Clio's exclusive POSIX writers. They retain the
    same local inode guard and release path, and cannot create or append files."
   [path]
-  (acquire-lock-mode! path true false))
+  (acquire-lock-mode! path true false nil))
 
 (defn acquire-entry-lock!
   "Like acquire-lock!, but open the directory entry with NOFOLLOW_LINKS so the
    checked entry is the opened inode: a symlink swapped in after a check fails
-   with :clio.fs/symlink-entry instead of redirecting outside the directory."
-  [path]
-  (acquire-lock-mode! path false true))
+   with :clio.fs/symlink-entry instead of redirecting outside the directory.
+
+   The entry must have exactly one link once locked. `:stale-aliases`, when
+   given, is a zero-argument function naming candidate entries that may only
+   exist while their owner holds this inode's lock (an interrupted publisher's
+   temp). Under the lock, candidates that are this same inode are deleted and
+   the directory is forced before the one-link guard runs."
+  ([path] (acquire-entry-lock! path nil))
+  ([path options] (acquire-lock-mode! path false true options)))
 
 (defn acquire-entry-read-lock!
-  "Shared-lock counterpart of acquire-entry-lock!."
-  [path]
-  (acquire-lock-mode! path true true))
+  "Shared-lock counterpart of acquire-entry-lock!, with the same `:stale-aliases`."
+  ([path] (acquire-entry-read-lock! path nil))
+  ([path options] (acquire-lock-mode! path true true options)))
 
 (defn- lock-entry [token]
   (or (get @active-locks (:lock/id token))

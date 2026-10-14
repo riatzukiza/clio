@@ -61,6 +61,12 @@ canonicalize the validated snapshots rather than rereading them. Segment entries
 are opened without following symlinks, so a symlink swapped in after a check is
 refused instead of read or written outside the directory; an exact retry
 repeats the file and directory durability fences before `:already-present`.
+A new segment is written to a hidden `.<event-id>.creating-*` temp and
+published by exclusive hard link; the temp is removed before the directory
+fence. If a publisher stops between the link and that removal, the next reader
+or writer holding the segment's lock removes the temp alias of the same inode
+and forces the directory, so the segment is not left permanently refused as a
+hard link. Any other extra link is still refused.
 Canonical order is
 still the causal/stream order above. Clio does not consult git: checking that
 committed segments were never edited or removed belongs to the caller (eta-mu's
