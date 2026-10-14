@@ -457,3 +457,51 @@
               (is (= 1 @reads) "each segment is captured exactly once")))))
       (finally
         (fs/remove-tree! directory)))))
+
+(deftest segment-append-recovery-keeps-segment-admission
+  (let [directory (str "/tmp/clio-segments-recovery-" (host/random-uuid))
+        schema-directory (str directory "/schemas")
+        segments (str directory "/segments")]
+    (try
+      (fs/ensure-dir! segments)
+      (let [rt (runtime/open schema-directory catalog)
+            revisions (:schema/revisions (runtime/refresh rt))
+            make (fn [stream amount]
+                   (event/make-event (:schema/current rt) :counter/opened
+                                     {:event/stream stream :event/seq 1
+                                      :event/actor "user:alice" :event/subject stream
+                                      :event/data {:amount amount}}))
+            facts {:event/stream "counter:r" :event/seq 1
+                   :event/actor "user:alice" :event/subject "counter:r"
+                   :event/data {:amount 3}}
+            recovery (try
+                       (with-redefs [fs/append-locked-text!
+                                     (fn [_ _] (throw (ex-info "Injected append failure" {})))]
+                         (runtime/append-segment! rt segments :counter/opened facts))
+                       nil
+                       (catch :default cause (:clio/append-recovery (ex-data cause))))]
+        (testing "segment recovery data names the segment directory"
+          (is (string? (:ledger/segment-directory recovery)))
+          (is (= :appended (:append/result (runtime/retry-append! rt recovery))))
+          (is (= :already-present (:append/result (runtime/retry-append! rt recovery)))))
+        (testing "a retried segment never admits a second, different event"
+          (let [candidate (make "counter:s" 4)
+                stranger (make "counter:t" 5)
+                path (ledger/segment-path segments (:event/id candidate))]
+            (ledger/create-ledger! path)
+            (ledger/append-event! revisions path stranger)
+            (is (= :clio.ledger/id-collision
+                   (error-code #(runtime/retry-append!
+                                 rt {:ledger/path (fs/absolute-path path)
+                                     :ledger/segment-directory (fs/absolute-path segments)
+                                     :event candidate}))))
+            (is (= [stranger] (ledger/read-ledger path)))))
+        (testing "segment recovery must name the event's own segment"
+          (let [candidate (make "counter:u" 6)]
+            (is (= :clio.runtime/invalid-append-recovery
+                   (error-code #(runtime/retry-append!
+                                 rt {:ledger/path (str (fs/absolute-path segments) "/other.edn")
+                                     :ledger/segment-directory (fs/absolute-path segments)
+                                     :event candidate})))))))
+      (finally
+        (fs/remove-tree! directory)))))

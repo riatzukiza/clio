@@ -48,8 +48,16 @@
   (append-law/validate-recovery! recovery)
   (try
     (let [runtime (refresh runtime)
-          {:ledger/keys [path] :keys [event]} recovery]
-      {:append/result (ledger/append-event! (:schema/revisions runtime) path event)
+          {:ledger/keys [path segment-directory] :keys [event]} recovery
+          revisions (:schema/revisions runtime)]
+      {:append/result (if segment-directory
+                        (do (when-not (= path (ledger/segment-path segment-directory (:event/id event)))
+                              (throw (ex-info "Segment recovery must name the event's own segment"
+                                              {:clio/error :clio.runtime/invalid-append-recovery
+                                               :ledger/path path
+                                               :ledger/segment-directory segment-directory})))
+                            (ledger/create-segment! revisions segment-directory event))
+                        (ledger/append-event! revisions path event))
        :event event
        :runtime runtime})
     (catch #?(:clj Exception :cljs :default) cause
@@ -85,18 +93,11 @@
 
 (defn append-segment!
   "Create one event and write it as its own segment file in `directory`.
-   Failures carry :clio/append-recovery for `retry-append!` like `append!`."
+   Failures carry :clio/append-recovery for `retry-append!` like `append!`; the
+   recovery names the segment directory, so a retry keeps segment-only admission."
   [runtime directory schema-id event-data]
   (let [event (event/make-event (:schema/current runtime) schema-id event-data)
-        path (ledger/ensure-segment-file! directory (:event/id event))
-        recovery {:ledger/path (recovery-path path) :event event}]
-    (append-law/validate-recovery! recovery)
-    (try
-      (let [runtime (refresh runtime)]
-        {:append/result (ledger/create-segment! (:schema/revisions runtime) directory event)
-         :event event
-         :runtime runtime})
-      (catch #?(:clj Exception :cljs :default) cause
-        (throw (ex-info (ex-message cause)
-                        (assoc (ex-data cause) :clio/append-recovery recovery)
-                        cause))))))
+        path (ledger/ensure-segment-file! directory (:event/id event))]
+    (retry-append! runtime {:ledger/path (recovery-path path)
+                            :ledger/segment-directory (recovery-path directory)
+                            :event event})))
