@@ -413,10 +413,26 @@
         (is (= [evt] (:canonical/events
                       (ledger/canonicalize-directory revisions segments []))))))))
 
-(defn- mkfifo! [path]
-  (let [process (.start (ProcessBuilder. ^java.util.List ["mkfifo" path]))]
+(defn- mkfifo! [path mode]
+  (let [process (.start (ProcessBuilder. ^java.util.List ["mkfifo" "-m" mode path]))]
     (when-not (zero? (.waitFor process))
       (throw (ex-info "mkfifo failed" {:path path})))))
+
+(defn- entry-open-threads []
+  (count (filter #(and (= "clio-entry-open" (.getName ^Thread %)) (.isAlive ^Thread %))
+                 (.keySet (Thread/getAllStackTraces)))))
+
+(defn- with-fifo-swapped-entry
+  "Make the entry check see a regular file (`decoy`) while the entry itself is a
+   FIFO with `mode`, i.e. a FIFO swapped in after the type check."
+  [entry decoy mode f]
+  (fs/delete-if-exists! entry)
+  (mkfifo! entry mode)
+  (let [file-key @#'fs/file-key]
+    (with-redefs [fs/file-key (fn
+                                ([p] (file-key p))
+                                ([p links] (file-key (if (= p entry) decoy p) links)))]
+      (f))))
 
 (deftest jvm-fifo-swapped-in-after-the-entry-check-fails-closed
   (with-ledger
@@ -425,27 +441,43 @@
             {evt :event} (runtime/append! runtime path :record/observed fixture/facts)
             revisions (:schema/revisions (runtime/refresh runtime))
             entry (ledger/segment-path segments (:event/id evt))
-            file-key @#'fs/file-key
-            swapped (atom false)]
+            decoy (str directory "/decoy.edn")]
         (fs/ensure-dir! segments)
         (is (= :appended (ledger/create-segment! revisions segments evt)))
-        ;; Swap a FIFO in after the regular-file inspection, before the open.
-        (with-redefs [fs/file-key (fn
-                                    ([p] (file-key p))
-                                    ([p links]
-                                     (let [k (file-key p links)]
-                                       (when (and (= p entry) (compare-and-set! swapped false true))
-                                         (fs/delete-if-exists! entry)
-                                         (mkfifo! entry))
-                                       k)))]
-          (let [result (binding [fs/*entry-open-timeout-ms* 500]
-                         (future (error-code #(ledger/canonicalize-directory revisions segments []))))
-                outcome (deref result 15000 ::hung)]
-            (when (= ::hung outcome)
-              ;; Unblock the reader so the test JVM can exit.
-              (with-open [_ (java.io.FileOutputStream. ^String entry)]))
-            (is @swapped)
-            (is (= :clio.fs/entry-open-blocked outcome))))
+        (fs/write-text! decoy (fs/read-text entry))
+        (testing "a writable FIFO swap is refused without any blocked open"
+          (with-fifo-swapped-entry
+            entry decoy "0644"
+            (fn []
+              (let [before (entry-open-threads)
+                    result (binding [fs/*entry-open-timeout-ms* 60000]
+                             (future (error-code #(ledger/canonicalize-directory revisions segments []))))
+                    outcome (deref result 15000 ::hung)]
+                (when (= ::hung outcome)
+                  (with-open [_ (java.io.FileOutputStream. ^String entry)]))
+                (is (contains? #{:clio.fs/not-regular-file :clio.fs/entry-replaced} outcome))
+                (is (= before (entry-open-threads)) "no opener thread is left blocked")))))
+        (when-not (= "root" (System/getProperty "user.name"))
+          (testing "a read-only FIFO swap uses the bounded fallback and caps blocked opens"
+            (with-fifo-swapped-entry
+              entry decoy "0444"
+              (fn []
+                (binding [fs/*entry-open-timeout-ms* 300]
+                  (is (= :clio.fs/entry-open-blocked
+                         (error-code #(ledger/canonicalize-directory revisions segments []))))
+                  (let [stuck (entry-open-threads)
+                        started (System/nanoTime)]
+                    (is (= :clio.fs/entry-open-blocked
+                           (error-code #(ledger/canonicalize-directory revisions segments []))))
+                    (is (< (/ (- (System/nanoTime) started) 1e6) 250.0)
+                        "the second attempt refuses at once instead of waiting")
+                    (is (= stuck (entry-open-threads)) "no second blocked opener")))
+                ;; Release the stuck reader; it closes its late channel.
+                (with-open [_ (java.io.FileOutputStream. ^String entry)])
+                (loop [n 0]
+                  (when (and (pos? (entry-open-threads)) (< n 100))
+                    (Thread/sleep 20) (recur (inc n))))
+                (is (zero? (entry-open-threads)))))))
         (fs/delete-if-exists! entry)))))
 
 (deftest jvm-segment-publish-recovery-and-hardlink-guards
