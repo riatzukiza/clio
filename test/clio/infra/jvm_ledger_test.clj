@@ -395,3 +395,53 @@
                      (error-code #(ledger/canonicalize-directory revisions segments [])))))
             (fs/delete-if-exists! link)))
         (is (= [evt] (:canonical/events (runtime/canonicalize-directory runtime segments []))))))))
+
+(deftest jvm-segment-publish-recovery-and-hardlink-guards
+  (with-ledger
+    (fn [{:keys [directory runtime]}]
+      (let [segments (str directory "/segments")
+            outside (str directory "/outside.edn")
+            missing (str directory "/missing-segments")
+            revisions (:schema/revisions (runtime/refresh runtime))
+            {evt :event} (runtime/append! runtime (str directory "/events.edn")
+                                          :record/observed fixture/facts)
+            other (event/make-event (:schema/current runtime) :record/observed
+                                    (assoc fixture/facts :event/stream "record:other"
+                                           :event/subject "record:other"))
+            facts (assoc fixture/facts :event/stream "record:m"
+                         :event/subject "record:m")]
+        (fs/ensure-dir! segments)
+        (testing "new segments publish only after the event is written"
+          (let [link! fs/hard-link!
+                saw (atom false)]
+            (with-redefs [fs/hard-link! (fn [from to]
+                                         (is (fs/exists? from))
+                                         (is (str/includes? from ".creating-"))
+                                         (is (not (fs/exists? to)))
+                                         (is (not (some #(= % to) (ledger/segment-paths segments))))
+                                         (reset! saw true)
+                                         (link! from to))]
+              (is (= :appended (ledger/create-segment! revisions segments evt)))
+              (is @saw))))
+        (testing "setup failures preserve append recovery"
+          (let [cause (try
+                        (runtime/append-segment! runtime missing :record/observed facts)
+                        nil
+                        (catch Exception e e))
+                recovery (:clio/append-recovery (ex-data cause))]
+            (is (= :clio.ledger/missing-directory (:clio/error (ex-data cause))))
+            (is (map? recovery))
+            (is (some? (:event/id (:event recovery))))
+            (is (= missing (:ledger/segment-directory recovery)))))
+        (testing "hard-linked segment entries are refused"
+          (ledger/create-ledger! outside)
+          (let [linked (ledger/segment-path segments (:event/id other))]
+            (fs/hard-link! outside linked)
+            (is (= :clio.ledger/segment-hardlink
+                   (error-code #(ledger/create-segment! revisions segments other))))
+            (is (= "" (fs/read-text outside)))
+            (is (= :clio.ledger/segment-hardlink
+                   (error-code #(ledger/canonicalize-directory revisions segments []))))
+            (fs/delete-if-exists! linked)))
+        (is (= [evt] (:canonical/events
+                      (runtime/canonicalize-directory runtime segments []))))))))

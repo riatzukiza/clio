@@ -25,6 +25,9 @@
 (defn missing-path-error? [cause]
   (= "ENOENT" (.-code cause)))
 
+(defn already-exists-error? [cause]
+  (= "EEXIST" (.-code cause)))
+
 (defn require-directory-sync-support!
   "Refuse a host without Linux directory durability before any write becomes visible."
   [path]
@@ -226,22 +229,50 @@
                         {:path path :clio/error :clio.fs/symlink-entry} cause))
         (throw cause)))))
 
+(defn- refuse-nofollow-entry-type!
+  "lstat the directory entry before any open. A FIFO/socket open with O_RDONLY
+   blocks until a writer appears; refuse non-regular types first. Hard-link
+   counts are checked only after the inode lock is held so a publisher that
+   briefly links an unpublished temp is not rejected mid-flight."
+  [path target-path]
+  (let [st (fs/lstatSync target-path)]
+    (cond
+      (.isSymbolicLink st)
+      (throw (ex-info "Directory entry is a symbolic link"
+                      {:path path :clio/error :clio.fs/symlink-entry}))
+
+      (not (.isFile st))
+      (throw (ex-info "Directory entry is not a regular file"
+                      {:path path :clio/error :clio.fs/not-regular-file})))))
+
+(defn- refuse-multiply-linked-fd!
+  [path fd]
+  (let [st (fs/fstatSync fd)
+        nlink (.-nlink st)]
+    (when-not (.isFile st)
+      (throw (ex-info "Directory entry is not a regular file"
+                      {:path path :clio/error :clio.fs/not-regular-file})))
+    (when (not= 1 nlink)
+      (throw (ex-info "Directory entry has additional hard links"
+                      {:path path
+                       :nlink nlink
+                       :clio/error :clio.fs/multiply-linked-entry})))))
+
 (defn- acquire-lock-mode!
   [path read-only? nofollow?]
   ;; Bind the resolved target before opening it: a later symlink retarget must
   ;; not move the parent fence away from the inode owned by this descriptor.
   ;; A no-follow open instead binds the named entry and refuses a symlink there.
   (let [target-path (if nofollow? (entry-path path) (absolute-path path))
+        _ (when nofollow? (refuse-nofollow-entry-type! path target-path))
         _ (refuse-locked-path! target-path)
         flags (if read-only?
                 (.-O_RDONLY (.-constants fs))
                 (bit-or (.-O_APPEND (.-constants fs)) (.-O_RDWR (.-constants fs))))
         fd (open-entry! target-path flags nofollow? path)]
     (try
-      (when (and nofollow? (not (.isFile (fs/fstatSync fd))))
-        (throw (ex-info "Directory entry is not a regular file"
-                        {:path path :clio/error :clio.fs/not-regular-file})))
       (acquire-native-lock! fd read-only?)
+      (when nofollow? (refuse-multiply-linked-fd! path fd))
       (swap! locked-paths assoc target-path (stat-identity (fs/fstatSync fd #js {:bigint true})))
       {:lock/path path :lock/target-path target-path :lock/fd fd}
       (catch :default cause

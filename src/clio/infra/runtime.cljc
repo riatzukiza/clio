@@ -94,10 +94,23 @@
 (defn append-segment!
   "Create one event and write it as its own segment file in `directory`.
    Failures carry :clio/append-recovery for `retry-append!` like `append!`; the
-   recovery names the segment directory, so a retry keeps segment-only admission."
+   recovery names the segment directory, so a retry keeps segment-only admission.
+   Segment setup (missing directory, rejected symlink/hard link, and similar)
+   runs inside the recovery-wrapping path so callers always receive the
+   already-generated event."
   [runtime directory schema-id event-data]
   (let [event (event/make-event (:schema/current runtime) schema-id event-data)
-        path (ledger/ensure-segment-file! directory (:event/id event))]
-    (retry-append! runtime {:ledger/path (recovery-path path)
-                            :ledger/segment-directory (recovery-path directory)
-                            :event event})))
+        ;; Path is lexical until create-segment! publishes; do not create an
+        ;; empty unlocked segment here — that raced with canonicalization.
+        recovery {:ledger/path (ledger/segment-path directory (:event/id event))
+                  :ledger/segment-directory directory
+                  :event event}]
+    (try
+      (retry-append! runtime recovery)
+      (catch #?(:clj Exception :cljs :default) cause
+        (if (contains? (ex-data cause) :clio/append-recovery)
+          (throw cause)
+          (throw (ex-info (ex-message cause)
+                          (assoc (or (ex-data cause) {})
+                                 :clio/append-recovery recovery)
+                          cause)))))))

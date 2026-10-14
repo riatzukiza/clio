@@ -1,6 +1,7 @@
 (ns clio.extern.js.fs-observer
   "Observe actual Node calls while retaining the real filesystem and file descriptors."
-  (:require ["node:fs" :as module-fs]
+  (:require ["node:child_process" :as child-process]
+            ["node:fs" :as module-fs]
             ["node:path" :as node-path]
             ["node:module" :refer [syncBuiltinESMExports]]))
 
@@ -8,6 +9,10 @@
 
 (defn symbolic-link! [target link]
   (.symlinkSync native target link))
+
+(defn mkfifo! [path]
+  (.execFileSync child-process "mkfifo" #js [path])
+  path)
 
 (defn relative-to-cwd [path]
   (.relative node-path (.cwd js/process) path))

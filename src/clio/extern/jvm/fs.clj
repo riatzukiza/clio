@@ -26,6 +26,9 @@
 (defn missing-path-error? [cause]
   (instance? NoSuchFileException cause))
 
+(defn already-exists-error? [cause]
+  (instance? java.nio.file.FileAlreadyExistsException cause))
+
 (def ^:private ^"[Ljava.nio.file.LinkOption;" nofollow-links
   (into-array LinkOption [LinkOption/NOFOLLOW_LINKS]))
 
@@ -232,6 +235,20 @@
       (try
         (let [lock (.lock channel 0 Long/MAX_VALUE (boolean read-only?))
               token (str (UUID/randomUUID))]
+          (when nofollow?
+            (let [nlink (try (long (Files/getAttribute (nio-path target-path)
+                                                       "unix:nlink"
+                                                       links))
+                             (catch Exception cause
+                               (throw (ex-info "Filesystem does not expose link count"
+                                               {:path path
+                                                :clio/error :clio.fs/unsupported-file-identity}
+                                               cause))))]
+              (when-not (= 1 nlink)
+                (throw (ex-info "Directory entry has additional hard links"
+                                {:path path
+                                 :nlink nlink
+                                 :clio/error :clio.fs/multiply-linked-entry})))))
           (swap! active-locks assoc token
                  {:channel channel :file-lock lock :file/key key
                   :path path :target-path target-path})

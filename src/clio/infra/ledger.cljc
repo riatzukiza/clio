@@ -202,10 +202,17 @@
   (let [lock (try
                (acquire! path)
                (catch #?(:clj Exception :cljs :default) cause
-                 (if (= :clio.fs/symlink-entry (:clio/error (ex-data cause)))
+                 (case (:clio/error (ex-data cause))
+                   :clio.fs/symlink-entry
                    (fail! :clio.ledger/segment-symlink
                           "Segment entry must not be a symbolic link"
                           {:path path})
+
+                   :clio.fs/multiply-linked-entry
+                   (fail! :clio.ledger/segment-hardlink
+                          "Segment entry must not be a hard link"
+                          {:path path})
+
                    (throw cause))))]
     (try
       (f lock)
@@ -215,7 +222,11 @@
   "Bring the segment file for `event-id` into being exactly once. A concurrent
    or retried creator that finds it already present is not an error. The segment
    directory must already exist — append never silently creates a replacement
-   for a typo, deletion, or unmounted volume."
+   for a typo, deletion, or unmounted volume.
+
+   Prefer `create-segment!` for writes: it publishes a populated segment under
+   lock rather than exposing an empty unlocked entry that canonicalization
+   could observe as `:clio.ledger/empty-segment`."
   [directory event-id]
   (require-directory! directory)
   (let [path (segment-path directory event-id)]
@@ -228,37 +239,77 @@
           (when-not (fs/exists? path) (throw cause)))))
     path))
 
+(defn- admit-locked-segment!
+  [lock path event]
+  (let [existing-text (fs/read-locked-text lock)
+        existing (parse-ledger-text path existing-text)]
+    (cond
+      (empty? existing)
+      (do (append-record! lock existing-text event) :appended)
+
+      (and (= 1 (count existing)) (= (first existing) event))
+      (do (fs/sync-locked! lock) :already-present)
+
+      (= 1 (count existing))
+      (fail! :clio.ledger/id-collision
+             "Segment already holds a different event"
+             {:path path :event/id (:event/id event)})
+
+      :else
+      (fail! :clio.ledger/multi-event-segment
+             "Segment file must hold exactly one event"
+             {:path path :count (count existing)}))))
+
+(defn- publish-new-segment!
+  "Write the event into a hidden temp, then claim the final name with an
+   exclusive hard link so readers never observe an unlocked empty segment."
+  [directory path event]
+  (let [tmp (str directory "/." (:event/id event) ".creating-" (random-uuid))]
+    (try
+      (create-ledger! tmp)
+      (with-segment-lock
+        fs/acquire-entry-lock! tmp
+        (fn [lock]
+          (append-record! lock "" event)
+          (try
+            (fs/hard-link! tmp path)
+            ;; Persist the published directory entry before acknowledging.
+            (fs/sync-directory! directory)
+            (fs/delete-if-exists! tmp)
+            :appended
+            (catch #?(:clj Exception :cljs :default) cause
+              (fs/delete-if-exists! tmp)
+              (if (fs/already-exists-error? cause)
+                ::claim-lost
+                (throw cause))))))
+      (catch #?(:clj Exception :cljs :default) cause
+        (fs/delete-if-exists! tmp)
+        (throw cause)))))
+
 (defn create-segment!
   "Write one validated event as its own segment. The segment is named by the
    event id, so an exact retry is :already-present and a different event with
    the same id is an :id-collision; other segments are never touched. Unlike
    ordinary ledger append, a preexisting segment never admits a second event.
-   The whole decision runs under one exclusive no-follow lock on the entry, and
-   an exact retry repeats both durability fences before it is acknowledged."
+   A brand-new segment is written to a hidden temp and published by exclusive
+   hard link under the writer lock, so concurrent canonicalization never sees
+   an unlocked empty entry. An exact retry repeats both durability fences
+   before it is acknowledged."
   [revisions directory event]
   (schema/validate-event! revisions event)
-  (let [path (ensure-segment-file! directory (:event/id event))]
-    (with-segment-lock
-      fs/acquire-entry-lock! path
-      (fn [lock]
-        (let [existing-text (fs/read-locked-text lock)
-              existing (parse-ledger-text path existing-text)]
-          (cond
-            (empty? existing)
-            (do (append-record! lock existing-text event) :appended)
-
-            (and (= 1 (count existing)) (= (first existing) event))
-            (do (fs/sync-locked! lock) :already-present)
-
-            (= 1 (count existing))
-            (fail! :clio.ledger/id-collision
-                   "Segment already holds a different event"
-                   {:path path :event/id (:event/id event)})
-
-            :else
-            (fail! :clio.ledger/multi-event-segment
-                   "Segment file must hold exactly one event"
-                   {:path path :count (count existing)})))))))
+  (require-directory! directory)
+  (let [path (segment-path directory (:event/id event))]
+    (refuse-segment-symlink! path)
+    (if (fs/exists? path)
+      (with-segment-lock
+        fs/acquire-entry-lock! path
+        #(admit-locked-segment! % path event))
+      (let [outcome (publish-new-segment! directory path event)]
+        (if (= ::claim-lost outcome)
+          (with-segment-lock
+            fs/acquire-entry-lock! path
+            #(admit-locked-segment! % path event))
+          outcome)))))
 
 (defn- read-segment!
   "Capture one segment snapshot through a no-follow shared lock and validate it

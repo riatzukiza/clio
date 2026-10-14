@@ -537,3 +537,69 @@
           (is (= :appended (ledger/create-segment! revisions segments valid)))))
       (finally
         (fs/remove-tree! directory)))))
+
+(deftest segment-publish-recovery-and-entry-guards
+  (let [directory (str "/tmp/clio-segments-p2-" (host/random-uuid))
+        schema-directory (str directory "/schemas")
+        segments (str directory "/segments")
+        outside (str directory "/outside.edn")]
+    (try
+      (fs/ensure-dir! segments)
+      (let [rt (runtime/open schema-directory catalog)
+            revisions (:schema/revisions (runtime/refresh rt))
+            make (fn [stream amount]
+                   (event/make-event (:schema/current rt) :counter/opened
+                                     {:event/stream stream :event/seq 1
+                                      :event/actor "user:alice" :event/subject stream
+                                      :event/data {:amount amount}}))
+            opened (make "counter:a" 1)
+            other (make "counter:b" 2)
+            facts {:event/stream "counter:m" :event/seq 1
+                   :event/actor "user:alice" :event/subject "counter:m"
+                   :event/data {:amount 9}}]
+        (testing "a new segment is published only after the event is written"
+          (let [link! fs/hard-link!
+                saw-complete (atom false)]
+            (with-redefs [fs/hard-link! (fn [from to]
+                                         (is (fs/exists? from) "temp must exist under the writer lock")
+                                         (is (str/includes? from ".creating-")
+                                             "publish must use a hidden creating temp")
+                                         (is (not (fs/exists? to))
+                                             "final name must be absent until exclusive claim")
+                                         (is (not (some #(= % to) (ledger/segment-paths segments))))
+                                         (reset! saw-complete true)
+                                         (link! from to))]
+              (is (= :appended (ledger/create-segment! revisions segments opened)))
+              (is @saw-complete)
+              (is (= [opened] (:canonical/events
+                               (ledger/canonicalize-directory revisions segments [])))))))
+        (testing "segment setup failures preserve append recovery"
+          (let [missing (str directory "/missing-segments")
+                cause (try
+                        (runtime/append-segment! rt missing :counter/opened facts)
+                        nil
+                        (catch :default e e))
+                recovery (:clio/append-recovery (ex-data cause))]
+            (is (= :clio.ledger/missing-directory (:clio/error (ex-data cause))))
+            (is (map? recovery))
+            (is (some? (:event/id (:event recovery))))
+            (is (= missing (:ledger/segment-directory recovery)))))
+        (testing "a FIFO segment entry fails closed without hanging"
+          (let [fifo (ledger/segment-path segments (:event/id other))]
+            (observer/mkfifo! fifo)
+            (is (= :clio.fs/not-regular-file
+                   (error-code #(ledger/canonicalize-directory revisions segments []))))
+            (fs/delete-if-exists! fifo)))
+        (testing "a hard-linked segment entry is refused"
+          (ledger/create-ledger! outside)
+          (let [linked (ledger/segment-path segments (:event/id other))]
+            (fs/hard-link! outside linked)
+            (is (= :clio.ledger/segment-hardlink
+                   (error-code #(ledger/create-segment! revisions segments other))))
+            (is (= "" (fs/read-text outside))
+                "append must not write through the hard link")
+            (is (= :clio.ledger/segment-hardlink
+                   (error-code #(ledger/canonicalize-directory revisions segments []))))
+            (fs/delete-if-exists! linked))))
+      (finally
+        (fs/remove-tree! directory)))))
