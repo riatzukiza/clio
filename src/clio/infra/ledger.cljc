@@ -154,18 +154,53 @@
            "Segment directory does not exist"
            {:path directory})))
 
+(defn- upper-char?
+  [ch]
+  (let [s (str ch)]
+    (not= s (str/lower-case s))))
+
+(defn- encode-segment-stem
+  "Map an event id to a directory-entry stem that stays distinct under
+   case-folding filesystems. Lowercase UUID text is unchanged; each uppercase
+   letter becomes `!<lower>` so case-variant ids never alias as one filename."
+  [event-id]
+  (->> event-id
+       (map (fn [ch]
+              (let [s (str ch)]
+                (if (upper-char? ch)
+                  (str "!" (str/lower-case s))
+                  s))))
+       (apply str)))
+
+(defn- decode-segment-stem
+  "Inverse of encode-segment-stem. Rejects a truncated `!` escape."
+  [stem]
+  (let [n (count stem)]
+    (loop [i 0 out ""]
+      (if (>= i n)
+        out
+        (let [ch (subs stem i (inc i))]
+          (if (= "!" ch)
+            (if (>= (inc i) n)
+              (fail! :clio.ledger/invalid-segment-id
+                     "Segment filename has a truncated case escape"
+                     {:stem stem})
+              (recur (+ i 2)
+                     (str out (str/upper-case (subs stem (inc i) (+ i 2))))))
+            (recur (inc i) (str out ch))))))))
+
 (defn segment-path
   "The content-addressed segment file for one event id inside `directory`.
-   The filename rule is the event identity law itself (`clio.law.event/uuid-string?`,
-   enforced by `schema/validate-event!` for every ledger), so the segment format
-   admits exactly the ids an ordinary ledger admits, and none can escape the
-   directory."
+   The filename rule admits exactly the ids an ordinary ledger admits
+   (`clio.law.event/uuid-string?`), encoded so case-variant ids remain distinct
+   even on case-folding filesystems. Lowercase UUID text keeps the plain
+   `<event-id>.edn` spelling."
   [directory event-id]
   (when-not (event-law/uuid-string? event-id)
     (fail! :clio.ledger/invalid-segment-id
            "Segment event id must be a plain identifier"
            {:event/id event-id}))
-  (str directory "/" event-id segment-suffix))
+  (str directory "/" (encode-segment-stem event-id) segment-suffix))
 
 (defn segment-paths
   "Every visible `*.edn` segment in `directory`, sorted only for deterministic
@@ -196,12 +231,24 @@
 
 (def ^:private creating-marker ".creating-")
 
+(defn- segment-stem-from-filename
+  [name]
+  (when (and name (str/ends-with? name segment-suffix))
+    (subs name 0 (- (count name) (count segment-suffix)))))
+
 (defn- publish-temp-path
   [directory event-id]
-  (str directory "/." event-id creating-marker (random-uuid)))
+  (str directory "/." (encode-segment-stem event-id) creating-marker (random-uuid)))
+
+(defn- creating-temp-stem
+  "Return the encoded segment stem of a hidden `.<stem>.creating-*` name, or nil."
+  [name]
+  (let [idx (str/index-of name creating-marker)]
+    (when (and idx (str/starts-with? name ".") (> idx 1))
+      (subs name 1 idx))))
 
 (defn- stale-publish-aliases
-  "Name the hidden publish temps of the segment at `path` (`.<event-id>.creating-*`
+  "Name the hidden publish temps of the segment at `path` (`.<stem>.creating-*`
    beside it). A publisher holds the segment inode's exclusive lock from before
    its hard link until after it deletes its temp, so any lock holder that still
    finds such a temp naming the same inode knows that publisher stopped in the
@@ -210,7 +257,7 @@
   (let [slash (str/last-index-of path "/")
         directory (subs path 0 slash)
         name (subs path (inc slash))
-        prefix (str "." (subs name 0 (- (count name) (count segment-suffix))) creating-marker)]
+        prefix (str "." (segment-stem-from-filename name) creating-marker)]
     (fn []
       (->> (fs/list-directory directory)
            (filter #(str/starts-with? % prefix))
@@ -243,6 +290,34 @@
       (f lock)
       (finally (fs/release-lock! lock)))))
 
+(defn- reclaim-unpublished-temp!
+  "If `name` is an unpublished creating temp (final segment absent), lock it and
+   delete it. A live publisher holds the temp lock, so this waits rather than
+   deleting in-flight work; multiply-linked post-publish aliases are left for
+   stale-publish-aliases."
+  [directory name]
+  (when-let [stem (creating-temp-stem name)]
+    (let [tmp (str directory "/" name)
+          final (str directory "/" stem segment-suffix)]
+      (when-not (fs/exists? final)
+        (try
+          (with-segment-lock
+            fs/acquire-entry-lock! tmp false
+            (fn [_]
+              (when-not (fs/exists? final)
+                (fs/delete-if-exists! tmp)
+                (fs/sync-directory! directory))))
+          (catch #?(:clj Exception :cljs :default) _
+            nil))))))
+
+(defn- reclaim-unpublished-temps!
+  "Drop orphaned pre-publish temps for `event-id` left by an interrupted write."
+  [directory event-id]
+  (let [prefix (str "." (encode-segment-stem event-id) creating-marker)]
+    (doseq [name (fs/list-directory directory)
+            :when (str/starts-with? name prefix)]
+      (reclaim-unpublished-temp! directory name))))
+
 (defn ensure-segment-file!
   "Bring the segment file for `event-id` into being exactly once. A concurrent
    or retried creator that finds it already present is not an error. The segment
@@ -261,7 +336,12 @@
         (create-ledger! path)
         (catch #?(:clj Exception :cljs :default) cause
           (refuse-segment-symlink! path)
-          (when-not (fs/exists? path) (throw cause)))))
+          ;; Only a concurrent creator's already-exists race is success. A
+          ;; post-creation parent sync (or any other) failure must stay visible
+          ;; even when the nondurable file entry remains.
+          (if (fs/already-exists-error? cause)
+            nil
+            (throw cause)))))
     path))
 
 (defn- admit-locked-segment!
@@ -287,8 +367,11 @@
 
 (defn- publish-new-segment!
   "Write the event into a hidden temp, then claim the final name with an
-   exclusive hard link so readers never observe an unlocked empty segment."
+   exclusive hard link so readers never observe an unlocked empty segment.
+   Orphaned pre-publish temps for this event id are reclaimed first so an
+   interrupted write cannot accumulate unbounded hidden files across retries."
   [directory path event]
+  (reclaim-unpublished-temps! directory (:event/id event))
   (let [tmp (publish-temp-path directory (:event/id event))]
     (try
       (create-ledger! tmp)
@@ -346,8 +429,7 @@
   [path]
   (refuse-segment-symlink! path)
   (let [name (last (str/split path #"/"))
-        expected-id (when (and name (str/ends-with? name segment-suffix))
-                      (subs name 0 (- (count name) (count segment-suffix))))
+        expected-id (some-> name segment-stem-from-filename decode-segment-stem)
         events (with-segment-lock
                  fs/acquire-entry-read-lock! path true
                  #(parse-ledger-text path (fs/read-locked-text %)))]

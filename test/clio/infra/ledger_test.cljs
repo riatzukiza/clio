@@ -613,8 +613,10 @@
   "Leave the state of a publisher stopped between its exclusive hard link and
    the temp delete: the published segment plus a hidden temp alias of its inode."
   [segments event]
-  (let [path (ledger/segment-path segments (:event/id event))]
-    (fs/hard-link! path (str segments "/." (:event/id event) ".creating-" (host/random-uuid)))
+  (let [path (ledger/segment-path segments (:event/id event))
+        stem (subs (last (str/split path #"/")) 0
+                   (- (count (last (str/split path #"/"))) (count ".edn")))]
+    (fs/hard-link! path (str segments "/." stem ".creating-" (host/random-uuid)))
     path))
 
 (deftest interrupted-publish-aliases-are-repaired-under-the-segment-lock
@@ -668,8 +670,14 @@
             (is (= 1 (observer/link-count path)))))
         (testing "only this segment's own temp aliases of its own inode are removed"
           (let [path (ledger/segment-path segments (:event/id other))
-                unrelated (str segments "/." (:event/id other) ".creating-" (host/random-uuid))
-                misnamed (str segments "/." (:event/id opened) ".creating-" (host/random-uuid))]
+                other-stem (subs (last (str/split path #"/")) 0
+                                 (- (count (last (str/split path #"/"))) (count ".edn")))
+                opened-stem (subs (last (str/split (ledger/segment-path segments (:event/id opened)) #"/"))
+                                  0
+                                  (- (count (last (str/split (ledger/segment-path segments (:event/id opened)) #"/")))
+                                     (count ".edn")))
+                unrelated (str segments "/." other-stem ".creating-" (host/random-uuid))
+                misnamed (str segments "/." opened-stem ".creating-" (host/random-uuid))]
             (ledger/create-ledger! unrelated)
             (fs/hard-link! path misnamed)
             (is (= :clio.ledger/segment-hardlink

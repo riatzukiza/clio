@@ -467,8 +467,10 @@
             evt (make "record:a")
             other (make "record:b")
             interrupt! (fn [e]
-                         (let [path (ledger/segment-path segments (:event/id e))]
-                           (fs/hard-link! path (str segments "/." (:event/id e) ".creating-"
+                         (let [path (ledger/segment-path segments (:event/id e))
+                               name (last (str/split path #"/"))
+                               stem (subs name 0 (- (count name) (count ".edn")))]
+                           (fs/hard-link! path (str segments "/." stem ".creating-"
                                                     (host/random-uuid)))
                            path))]
         (fs/ensure-dir! segments)
@@ -498,8 +500,14 @@
         (testing "only this segment's own temp aliases of its own inode are removed"
           (is (= :appended (ledger/create-segment! revisions segments other)))
           (let [path (ledger/segment-path segments (:event/id other))
-                unrelated (str segments "/." (:event/id other) ".creating-" (host/random-uuid))
-                misnamed (str segments "/." (:event/id evt) ".creating-" (host/random-uuid))]
+                other-stem (subs (last (str/split path #"/")) 0
+                                 (- (count (last (str/split path #"/"))) (count ".edn")))
+                evt-stem (subs (last (str/split (ledger/segment-path segments (:event/id evt)) #"/"))
+                               0
+                               (- (count (last (str/split (ledger/segment-path segments (:event/id evt)) #"/")))
+                                  (count ".edn")))
+                unrelated (str segments "/." other-stem ".creating-" (host/random-uuid))
+                misnamed (str segments "/." evt-stem ".creating-" (host/random-uuid))]
             (ledger/create-ledger! unrelated)
             (fs/hard-link! path misnamed)
             (is (= :clio.ledger/segment-hardlink

@@ -23,6 +23,13 @@
   [path]
   (str (.toRealPath (nio-path path) no-links)))
 
+(defn absolute-lexical-path
+  "Make `path` absolute against the process working directory without requiring
+   the target to exist. Unlike absolute-path, this does not consult the
+   filesystem or resolve symlinks; it only eliminates relative spelling."
+  [path]
+  (str (.normalize (.toAbsolutePath (nio-path path)))))
+
 (defn missing-path-error? [cause]
   (instance? NoSuchFileException cause))
 

@@ -97,9 +97,11 @@
    recovery names the segment directory, so a retry keeps segment-only admission.
    Segment setup (missing directory, rejected symlink/hard link, and similar)
    runs inside the recovery-wrapping path so callers always receive the
-   already-generated event."
+   already-generated event. Recovery paths are absolute-lexical so a retry after
+   restart from another working directory still names the original directory."
   [runtime directory schema-id event-data]
-  (let [event (event/make-event (:schema/current runtime) schema-id event-data)
+  (let [directory (fs/absolute-lexical-path directory)
+        event (event/make-event (:schema/current runtime) schema-id event-data)
         ;; Path is lexical until create-segment! publishes; do not create an
         ;; empty unlocked segment here — that raced with canonicalization.
         recovery {:ledger/path (ledger/segment-path directory (:event/id event))

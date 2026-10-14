@@ -22,6 +22,13 @@
   ;; links. The native resolver follows the same filesystem semantics as open.
   (.native ^js (.-realpathSync fs) path))
 
+(defn absolute-lexical-path
+  "Make `path` absolute against the process working directory without requiring
+   the target to exist. Unlike absolute-path, this does not consult the
+   filesystem or resolve symlinks; it only eliminates relative spelling."
+  [path]
+  (.resolve node-path path))
+
 (defn missing-path-error? [cause]
   (= "ENOENT" (.-code cause)))
 

@@ -39,8 +39,10 @@ causal claim.
 ## Segment directories
 
 A ledger may also be stored as a directory of immutable segments, one event per
-file, named `<event-id>.edn`. Segment names follow the event identity law (a
-UUID string), so any event an ordinary ledger admits can be a segment. Because partitioning has no semantic authority,
+file, named from the event id. Lowercase UUID ids keep the plain `<event-id>.edn`
+spelling; uppercase letters are encoded as `!<lower>` so case-variant ids stay
+distinct on case-folding filesystems. Segment names admit exactly the ids an
+ordinary ledger admits. Because partitioning has no semantic authority,
 a segment directory (optionally unioned with a frozen legacy ledger file)
 canonicalizes exactly like the same events in one file, and branches that each
 add segments merge without textual conflicts.
@@ -61,7 +63,8 @@ canonicalize the validated snapshots rather than rereading them. Segment entries
 are opened without following symlinks, so a symlink swapped in after a check is
 refused instead of read or written outside the directory; an exact retry
 repeats the file and directory durability fences before `:already-present`.
-A new segment is written to a hidden `.<event-id>.creating-*` temp and
+A new segment is written to a hidden `.<stem>.creating-*` temp (stem matching
+the segment filename) and
 published by exclusive hard link; the temp is removed before the directory
 fence. If a publisher stops between the link and that removal, the next reader
 or writer holding the segment's lock removes the temp alias of the same inode
