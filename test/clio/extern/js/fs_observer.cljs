@@ -10,6 +10,11 @@
 (defn symbolic-link! [target link]
   (.symlinkSync native target link))
 
+(defn link-count
+  "The directory entry's own hard-link count (lstat, so a symlink is not followed)."
+  [path]
+  (.-nlink (.lstatSync native path)))
+
 (defn mkfifo! [path]
   (.execFileSync child-process "mkfifo" #js [path])
   path)

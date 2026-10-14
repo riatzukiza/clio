@@ -445,3 +445,68 @@
             (fs/delete-if-exists! linked)))
         (is (= [evt] (:canonical/events
                       (runtime/canonicalize-directory runtime segments []))))))))
+
+(defn- link-count [path]
+  (long (java.nio.file.Files/getAttribute
+         (java.nio.file.Paths/get ^String path (make-array String 0))
+         "unix:nlink"
+         (into-array java.nio.file.LinkOption [java.nio.file.LinkOption/NOFOLLOW_LINKS]))))
+
+(defn- creating-entries [segments]
+  (filterv #(str/includes? % ".creating-") (fs/list-directory segments)))
+
+(deftest jvm-interrupted-publish-aliases-are-repaired-under-the-segment-lock
+  (with-ledger
+    (fn [{:keys [directory runtime]}]
+      (let [segments (str directory "/segments")
+            revisions (:schema/revisions (runtime/refresh runtime))
+            make (fn [stream]
+                   (event/make-event (:schema/current runtime) :record/observed
+                                     (assoc fixture/facts :event/stream stream
+                                            :event/subject stream)))
+            evt (make "record:a")
+            other (make "record:b")
+            interrupt! (fn [e]
+                         (let [path (ledger/segment-path segments (:event/id e))]
+                           (fs/hard-link! path (str segments "/." (:event/id e) ".creating-"
+                                                    (host/random-uuid)))
+                           path))]
+        (fs/ensure-dir! segments)
+        (testing "publication drops the temp alias before the directory fence"
+          (let [path (ledger/segment-path segments (:event/id evt))
+                sync! fs/sync-directory!
+                overlaps (atom [])]
+            (with-redefs [fs/sync-directory! (fn [dir]
+                                               (when (and (fs/exists? path)
+                                                          (seq (creating-entries segments)))
+                                                 (swap! overlaps conj dir))
+                                               (sync! dir))]
+              (is (= :appended (ledger/create-segment! revisions segments evt))))
+            (is (= [] @overlaps))
+            (is (= 1 (link-count path)))))
+        (testing "canonicalization repairs a stale temp alias of the same inode"
+          (let [path (interrupt! evt)]
+            (is (= 2 (link-count path)))
+            (is (= [evt] (:canonical/events (ledger/canonicalize-directory revisions segments []))))
+            (is (= [] (creating-entries segments)))
+            (is (= 1 (link-count path)))))
+        (testing "an exact retry repairs the alias and is :already-present"
+          (let [path (interrupt! evt)]
+            (is (= :already-present (ledger/create-segment! revisions segments evt)))
+            (is (= [] (creating-entries segments)))
+            (is (= 1 (link-count path)))))
+        (testing "only this segment's own temp aliases of its own inode are removed"
+          (is (= :appended (ledger/create-segment! revisions segments other)))
+          (let [path (ledger/segment-path segments (:event/id other))
+                unrelated (str segments "/." (:event/id other) ".creating-" (host/random-uuid))
+                misnamed (str segments "/." (:event/id evt) ".creating-" (host/random-uuid))]
+            (ledger/create-ledger! unrelated)
+            (fs/hard-link! path misnamed)
+            (is (= :clio.ledger/segment-hardlink
+                   (error-code #(ledger/canonicalize-directory revisions segments []))))
+            (is (fs/exists? unrelated))
+            (is (fs/exists? misnamed))
+            (fs/delete-if-exists! misnamed)
+            (fs/delete-if-exists! unrelated)
+            (is (= 2 (count (:canonical/events
+                             (ledger/canonicalize-directory revisions segments [])))))))))))

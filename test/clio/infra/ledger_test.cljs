@@ -9,6 +9,7 @@
             [clio.infra.projection :as projection]
             [clio.infra.runtime :as runtime]
             [clio.law.schema :as schema-law]
+            [clio.shape.edn :as edn]
             [clojure.string :as str]
             [promesa.core :as p]))
 
@@ -603,3 +604,145 @@
             (fs/delete-if-exists! linked))))
       (finally
         (fs/remove-tree! directory)))))
+
+(defn- creating-entries
+  [segments]
+  (filterv #(str/includes? % ".creating-") (fs/list-directory segments)))
+
+(defn- interrupt-publish!
+  "Leave the state of a publisher stopped between its exclusive hard link and
+   the temp delete: the published segment plus a hidden temp alias of its inode."
+  [segments event]
+  (let [path (ledger/segment-path segments (:event/id event))]
+    (fs/hard-link! path (str segments "/." (:event/id event) ".creating-" (host/random-uuid)))
+    path))
+
+(deftest interrupted-publish-aliases-are-repaired-under-the-segment-lock
+  (let [directory (str "/tmp/clio-segments-stale-" (host/random-uuid))
+        schema-directory (str directory "/schemas")
+        segments (str directory "/segments")]
+    (try
+      (fs/ensure-dir! segments)
+      (let [rt (runtime/open schema-directory catalog)
+            revisions (:schema/revisions (runtime/refresh rt))
+            make (fn [stream amount]
+                   (event/make-event (:schema/current rt) :counter/opened
+                                     {:event/stream stream :event/seq 1
+                                      :event/actor "user:alice" :event/subject stream
+                                      :event/data {:amount amount}}))
+            opened (make "counter:a" 1)
+            other (make "counter:b" 2)]
+        (testing "publication drops the temp alias before the directory fence"
+          (let [path (ledger/segment-path segments (:event/id opened))
+                sync! fs/sync-directory!
+                overlaps (atom [])]
+            (with-redefs [fs/sync-directory! (fn [dir]
+                                               (when (and (fs/exists? path)
+                                                          (seq (creating-entries segments)))
+                                                 (swap! overlaps conj dir))
+                                               (sync! dir))]
+              (is (= :appended (ledger/create-segment! revisions segments opened))))
+            (is (= [] @overlaps) "no directory fence persists both names of one inode")
+            (is (= 1 (observer/link-count path)))))
+        (testing "canonicalization repairs a stale temp alias of the same inode"
+          (let [path (interrupt-publish! segments opened)]
+            (is (= 2 (observer/link-count path)))
+            (is (= [opened] (:canonical/events
+                             (ledger/canonicalize-directory revisions segments []))))
+            (is (= [] (creating-entries segments)))
+            (is (= 1 (observer/link-count path)))))
+        (testing "an exact retry repairs the alias and is :already-present"
+          (let [path (interrupt-publish! segments opened)]
+            (is (= :already-present (ledger/create-segment! revisions segments opened)))
+            (is (= [] (creating-entries segments)))
+            (is (= 1 (observer/link-count path)))))
+        (testing "runtime retry-append! finishes the preserved recovery"
+          (is (= :appended (ledger/create-segment! revisions segments other)))
+          (let [path (interrupt-publish! segments other)]
+            (is (= :already-present
+                   (:append/result
+                    (runtime/retry-append! rt {:ledger/path (fs/absolute-path path)
+                                               :ledger/segment-directory (fs/absolute-path segments)
+                                               :event other}))))
+            (is (= [] (creating-entries segments)))
+            (is (= 1 (observer/link-count path)))))
+        (testing "only this segment's own temp aliases of its own inode are removed"
+          (let [path (ledger/segment-path segments (:event/id other))
+                unrelated (str segments "/." (:event/id other) ".creating-" (host/random-uuid))
+                misnamed (str segments "/." (:event/id opened) ".creating-" (host/random-uuid))]
+            (ledger/create-ledger! unrelated)
+            (fs/hard-link! path misnamed)
+            (is (= :clio.ledger/segment-hardlink
+                   (error-code #(ledger/canonicalize-directory revisions segments []))))
+            (is (fs/exists? unrelated) "a different inode under this segment's temp prefix is kept")
+            (is (fs/exists? misnamed) "another segment's temp name is never treated as this segment's")
+            (is (= 2 (observer/link-count path)))
+            (fs/delete-if-exists! misnamed)
+            (fs/delete-if-exists! unrelated)
+            (is (= [opened other]
+                   (sort-by #(:amount (:event/data %))
+                            (:canonical/events (ledger/canonicalize-directory revisions segments []))))))))
+      (finally
+        (fs/remove-tree! directory)))))
+
+(deftest concurrent-processes-publish-one-segment
+  (async done
+    (let [directory (str "/tmp/clio-segments-race-" (host/random-uuid))
+          schema-directory (str directory "/schemas")
+          finish (fn []
+                   (fs/remove-tree! directory)
+                   (done))]
+      (try
+        (fs/ensure-dir! directory)
+        (let [rt (runtime/open schema-directory catalog)
+              revision (:schema/current rt)
+              make (fn [actor amount]
+                     (event/make-event
+                      revision :counter/opened
+                      {:event/stream "counter:race" :event/seq 1
+                       :event/actor actor :event/subject "counter:race"
+                       :event/data {:amount amount}}))
+              event-a (make "worker:a" 1)
+              ;; Different data under the same id.
+              event-b (assoc (make "worker:b" 2) :event/id (:event/id event-a))
+              worker (str (process/cwd) "/test/clio/infra/segment_worker.nbb")
+              race! (fn [segments events]
+                      (fs/ensure-dir! segments)
+                      (let [start-at (+ (process/now-ms) 3000)]
+                        (p/let [results (process/run-concurrently!
+                                         (mapv (fn [evt]
+                                                 {:command "pnpm"
+                                                  :cwd (process/cwd)
+                                                  ;; The workspace nbb; see kernel-lock-test.
+                                                  :args ["exec" "nbb" worker segments
+                                                         (pr-str evt) (pr-str start-at)]})
+                                               events))]
+                          (mapv (fn [{:keys [stdout]}]
+                                  (let [{:keys [result error]}
+                                        (some-> (re-find #"\{:(?:result|error)[^\n]*\}" stdout)
+                                                edn/read-one)]
+                                    (or result error stdout)))
+                                results))))
+              settled? (fn [segments event]
+                         (let [path (ledger/segment-path segments (:event/id event))]
+                           (is (= [event] (ledger/read-ledger path)) "the segment holds one event")
+                           (is (= 1 (observer/link-count path)))
+                           (is (= [] (creating-entries segments)) "no publish temp remains")))
+              workflow
+              (p/let [same (race! (str directory "/same") [event-a event-a])
+                      _ (testing "two processes publishing the same event"
+                          (is (= #{:appended :already-present} (set same)) (pr-str same))
+                          (settled? (str directory "/same") event-a))
+                      clash (race! (str directory "/clash") [event-a event-b])]
+                (testing "two processes publishing different data under one id"
+                  (is (= #{:appended :clio.ledger/id-collision} (set clash)) (pr-str clash))
+                  (let [winner (if (= :appended (first clash)) event-a event-b)]
+                    (settled? (str directory "/clash") winner)))
+                (finish))]
+          (p/catch workflow
+                   (fn [cause]
+                     (is false (str "concurrent segment probe failed: " cause))
+                     (finish))))
+        (catch :default cause
+          (is false (str "concurrent segment setup failed: " cause))
+          (finish))))))
