@@ -30,6 +30,24 @@
   [path]
   (str (.normalize (.toAbsolutePath (nio-path path)))))
 
+(defn directory-identity
+  "Device/inode of an existing directory after resolving the final path."
+  [path]
+  (let [p (nio-path path)
+        ^BasicFileAttributes attrs (Files/readAttributes p BasicFileAttributes no-links)]
+    (when-not (.isDirectory attrs)
+      (throw (ex-info "Path is not a directory"
+                      {:path path :clio/error :clio.fs/not-directory})))
+    [(str (Files/getAttribute p "unix:dev" no-links))
+     (str (Files/getAttribute p "unix:ino" no-links))]))
+
+(defn same-directory-identity?
+  "True when `path` still names the directory identity captured earlier."
+  [path identity]
+  (try
+    (= (directory-identity path) identity)
+    (catch Exception _ false)))
+
 (defn missing-path-error? [cause]
   (instance? NoSuchFileException cause))
 

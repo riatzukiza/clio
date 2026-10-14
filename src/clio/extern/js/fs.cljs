@@ -29,6 +29,22 @@
   [path]
   (.resolve node-path path))
 
+(defn directory-identity
+  "Device/inode of an existing directory after resolving the final path."
+  [path]
+  (let [st (fs/statSync path #js {:bigint true})]
+    (when-not (.isDirectory st)
+      (throw (ex-info "Path is not a directory"
+                      {:path path :clio/error :clio.fs/not-directory})))
+    [(str (.-dev st)) (str (.-ino st))]))
+
+(defn same-directory-identity?
+  "True when `path` still names the directory identity captured earlier."
+  [path identity]
+  (try
+    (= (directory-identity path) identity)
+    (catch :default _ false)))
+
 (defn missing-path-error? [cause]
   (= "ENOENT" (.-code cause)))
 

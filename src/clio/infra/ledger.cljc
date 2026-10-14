@@ -160,19 +160,30 @@
            {:path directory})))
 
 (defn- bind-segment-directory!
-  "Resolve `directory` once to its real path after the existence check. Publish,
-   reclaim, and retry paths all use this binding so a symlink retarget during
-   publication cannot split the temp delete and directory fence onto another store."
+  "Resolve `directory` once to its real path after the existence check and capture
+   its device/inode. Publish, reclaim, and retry paths all use this binding so a
+   symlink retarget or directory rename+replace cannot silently redirect the
+   operation onto another store."
   [directory]
   (require-directory! directory)
-  (try
-    (fs/absolute-path directory)
-    (catch #?(:clj Exception :cljs :default) cause
-      (if (fs/missing-path-error? cause)
-        (fail! :clio.ledger/missing-directory
-               "Segment directory does not exist"
-               {:path directory})
-        (throw cause)))))
+  (let [real (try
+               (fs/absolute-path directory)
+               (catch #?(:clj Exception :cljs :default) cause
+                 (if (fs/missing-path-error? cause)
+                   (fail! :clio.ledger/missing-directory
+                          "Segment directory does not exist"
+                          {:path directory})
+                   (throw cause))))]
+    [real (fs/directory-identity real)]))
+
+(defn- ensure-bound-directory!
+  "Fail closed when the bound directory inode no longer sits at `directory`."
+  [directory identity]
+  (when-not (fs/same-directory-identity? directory identity)
+    (fail! :clio.ledger/directory-replaced
+           "Segment directory was replaced during the operation"
+           {:path directory}))
+  directory)
 
 (defn- upper-char?
   [ch]
@@ -242,7 +253,8 @@
   [directory]
   ;; Resolve once: enumeration and every returned path name the same real
   ;; directory, so a symlink retarget after listing cannot mix two stores.
-  (let [directory (bind-segment-directory! directory)
+  (let [[directory identity] (bind-segment-directory! directory)
+        _ (ensure-bound-directory! directory identity)
         names (try
                 (fs/list-directory directory)
                 (catch #?(:clj Exception :cljs :default) cause
@@ -251,6 +263,7 @@
                            "Segment directory does not exist"
                            {:path directory})
                     (throw cause))))
+        _ (ensure-bound-directory! directory identity)
         variants (filterv edn-suffix-case-variant? names)]
     (when (seq variants)
       (fail! :clio.ledger/noncanonical-segment-suffix
@@ -280,6 +293,16 @@
   [directory event-id]
   (str directory "/." (encode-segment-stem event-id) creating-marker (random-uuid)))
 
+(defn- publish-temp-basename?
+  "True when `name` is exactly `.<stem>.creating-<uuid>` — the grammar
+   publish-temp-path emits. Prefix-only matching would reclaim operator backups
+   such as `.<stem>.creating-backup`."
+  [stem name]
+  (let [prefix (str "." stem creating-marker)]
+    (and (string? name)
+         (str/starts-with? name prefix)
+         (event-law/uuid-string? (subs name (count prefix))))))
+
 (defn- stale-publish-aliases
   "Name the hidden publish temps of the segment at `path` (`.<stem>.creating-*`
    beside it). A publisher holds the segment inode's exclusive lock from before
@@ -290,10 +313,10 @@
   (let [slash (str/last-index-of path "/")
         directory (subs path 0 slash)
         name (subs path (inc slash))
-        prefix (str "." (segment-stem-from-filename name) creating-marker)]
+        stem (segment-stem-from-filename name)]
     (fn []
       (->> (fs/list-directory directory)
-           (filter #(str/starts-with? % prefix))
+           (filter #(publish-temp-basename? stem %))
            (mapv #(str directory "/" %))))))
 
 (defn- with-segment-lock
@@ -332,9 +355,9 @@
    alone."
   [directory event-id]
   (let [final (segment-path directory event-id)
-        prefix (str "." (encode-segment-stem event-id) creating-marker)]
+        stem (encode-segment-stem event-id)]
     (when (fs/exists? final)
-      (let [candidates (filterv #(str/starts-with? % prefix) (fs/list-directory directory))
+      (let [candidates (filterv #(publish-temp-basename? stem %) (fs/list-directory directory))
             removed (atom false)]
         (doseq [name candidates]
           (let [tmp (str directory "/" name)]
@@ -409,7 +432,7 @@
    reclaims it in the tiny create→lock window (or the hard-link races), and
    the final segment exists, the result is ::claim-lost so create-segment!
    admits through the final path instead of surfacing a raw ENOENT."
-  [directory path event]
+  [directory path event identity]
   (let [tmp (publish-temp-path directory (:event/id event))]
     (try
       (create-ledger! tmp)
@@ -421,13 +444,16 @@
                   (append-record! lock "" event)
                   (let [published
                         (try
+                          (ensure-bound-directory! directory identity)
                           (fs/hard-link! tmp path)
                           ;; Drop the temp alias first so the published entry returns to one
                           ;; link, then persist both directory changes before acknowledging.
                           ;; A stop inside this window leaves a same-inode temp that the next
                           ;; segment lock holder removes (see stale-publish-aliases).
+                          (ensure-bound-directory! directory identity)
                           (fs/delete-if-exists! tmp)
                           (fs/sync-directory! directory)
+                          (ensure-bound-directory! directory identity)
                           :appended
                           (catch #?(:clj Exception :cljs :default) cause
                             (fs/delete-if-exists! tmp)
@@ -466,22 +492,25 @@
    symlink retarget cannot split publication across two stores."
   [revisions directory event]
   (schema/validate-event! revisions event)
-  (let [directory (bind-segment-directory! directory)
+  (let [[directory identity] (bind-segment-directory! directory)
         path (segment-path directory (:event/id event))]
+    (ensure-bound-directory! directory identity)
     (refuse-segment-symlink! path)
     (let [outcome
           (if (fs/exists? path)
             (with-segment-lock
               fs/acquire-entry-lock! path true
               #(admit-locked-segment! % path event))
-            (let [published (publish-new-segment! directory path event)]
-              (if (= ::claim-lost published)
-                (with-segment-lock
-                  fs/acquire-entry-lock! path true
-                  #(admit-locked-segment! % path event))
-                published)))]
+            (do (ensure-bound-directory! directory identity)
+                (let [published (publish-new-segment! directory path event identity)]
+                  (if (= ::claim-lost published)
+                    (with-segment-lock
+                      fs/acquire-entry-lock! path true
+                      #(admit-locked-segment! % path event))
+                    published))))]
       ;; publish-new-segment! already sweeps after a fresh claim; retries that
       ;; find the final name still clear any leftover creating temps.
+      (ensure-bound-directory! directory identity)
       (reclaim-unpublished-temps! directory (:event/id event))
       outcome)))
 

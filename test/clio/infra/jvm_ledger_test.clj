@@ -644,6 +644,49 @@
                         (ledger/canonicalize-directory revisions a [])))))))))
 
 
+
+(deftest jvm-reclaim-skips-non-uuid-creating-suffixes
+  ;; Prefix-only matching would unlink operator backups such as
+  ;; .<stem>.creating-backup after an exact retry.
+  (with-ledger
+    (fn [{:keys [directory path runtime]}]
+      (let [segments (str directory "/segments")
+            {evt :event} (runtime/append! runtime path :record/observed fixture/facts)
+            revisions (:schema/revisions (runtime/refresh runtime))
+            stem (#'ledger/encode-segment-stem (:event/id evt))
+            backup (str segments "/." stem ".creating-backup")]
+        (fs/ensure-dir! segments)
+        (is (= :appended (ledger/create-segment! revisions segments evt)))
+        (spit backup "{:note :operator-backup}\n")
+        (is (= :already-present (ledger/create-segment! revisions segments evt)))
+        (is (.exists (java.io.File. backup))
+            "non-uuid creating suffix must survive reclaim")
+        (is (empty?
+             (filterv #(re-matches #".*\.creating-[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}" %)
+                      (fs/list-directory segments))))))))
+
+(deftest jvm-create-segment-refuses-directory-replaced-mid-publish
+  ;; Rename the bound store away and put a replacement at the same path after
+  ;; the hard link; publication must fail closed rather than fence the impostor.
+  (with-ledger
+    (fn [{:keys [directory path runtime]}]
+      (let [store (str directory "/store")
+            moved (str directory "/store-moved")
+            impostor (str directory "/impostor")
+            {evt :event} (runtime/append! runtime path :record/observed fixture/facts)
+            revisions (:schema/revisions (runtime/refresh runtime))
+            link! fs/hard-link!]
+        (fs/ensure-dir! store)
+        (fs/ensure-dir! impostor)
+        (with-redefs [fs/hard-link! (fn [from to]
+                                      (link! from to)
+                                      (.renameTo (java.io.File. store) (java.io.File. moved))
+                                      (.renameTo (java.io.File. impostor) (java.io.File. store)))]
+          (is (= :clio.ledger/directory-replaced
+                 (error-code #(ledger/create-segment! revisions store evt)))))
+        (is (seq (creating-entries moved))
+            "the original store keeps its in-flight publish state for recovery")))))
+
 (deftest jvm-interrupted-publish-aliases-are-repaired-under-the-segment-lock
   (with-ledger
     (fn [{:keys [directory runtime]}]
