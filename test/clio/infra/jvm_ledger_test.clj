@@ -483,6 +483,42 @@
                 (is (zero? (entry-open-threads)))))))
         (fs/delete-if-exists! entry)))))
 
+(deftest jvm-segment-directory-is-bound-and-never-empty
+  (with-ledger
+    (fn [{:keys [directory path runtime]}]
+      (let [a (str directory "/store-a")
+            b (str directory "/store-b")
+            link (str directory "/segments-link")
+            {evt :event} (runtime/append! runtime path :record/observed fixture/facts)
+            revisions (:schema/revisions (runtime/refresh runtime))
+            nio #(java.nio.file.Paths/get ^String % (make-array String 0))
+            point! (fn [target]
+                     (java.nio.file.Files/deleteIfExists (nio link))
+                     (java.nio.file.Files/createSymbolicLink
+                      (nio link) (nio target)
+                      (make-array java.nio.file.attribute.FileAttribute 0)))]
+        (testing "an empty segment-directory string is refused, not resolved to cwd"
+          (let [cwd-before (set (fs/list-directory "."))]
+            (is (= :clio.ledger/empty-directory-path
+                   (error-code #(runtime/append-segment! runtime "" :record/observed fixture/facts))))
+            (is (= :clio.ledger/empty-directory-path (error-code #(ledger/segment-paths ""))))
+            (is (= :clio.ledger/empty-directory-path
+                   (error-code #(ledger/create-segment! revisions "" evt))))
+            (is (= cwd-before (set (fs/list-directory "."))))))
+        (testing "enumeration and paths bind one real directory across a retarget"
+          (fs/ensure-dir! a)
+          (fs/ensure-dir! b)
+          (is (= :appended (ledger/create-segment! revisions a evt)))
+          (point! a)
+          (let [list-directory fs/list-directory
+                paths (with-redefs [fs/list-directory (fn [p]
+                                                        (let [names (list-directory p)]
+                                                          (point! b)
+                                                          names))]
+                        (ledger/segment-paths link))]
+            (is (= [(str (fs/absolute-path a) "/" (last (str/split (first paths) #"/")))] paths))
+            (is (every? #(str/starts-with? % (str (fs/absolute-path a) "/")) paths))))))))
+
 (deftest jvm-segment-publish-recovery-and-hardlink-guards
   (with-ledger
     (fn [{:keys [directory runtime]}]
