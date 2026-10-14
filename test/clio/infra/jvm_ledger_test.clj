@@ -519,6 +519,22 @@
             (is (= [(str (fs/absolute-path a) "/" (last (str/split (first paths) #"/")))] paths))
             (is (every? #(str/starts-with? % (str (fs/absolute-path a) "/")) paths))))))))
 
+(deftest jvm-segment-reads-reflush-the-directory-after-uncertain-repair
+  ;; A stale-alias deletion whose directory force failed is invisible to a
+  ;; retry, so every segment read fences the directory before returning.
+  (with-ledger
+    (fn [{:keys [directory path runtime]}]
+      (let [segments (str directory "/segments")
+            {evt :event} (runtime/append! runtime path :record/observed fixture/facts)
+            revisions (:schema/revisions (runtime/refresh runtime))
+            synced (atom [])
+            sync! fs/sync-directory!]
+        (fs/ensure-dir! segments)
+        (is (= :appended (ledger/create-segment! revisions segments evt)))
+        (with-redefs [fs/sync-directory! (fn [p] (swap! synced conj p) (sync! p))]
+          (is (= [evt] (:canonical/events (ledger/canonicalize-directory revisions segments [])))))
+        (is (some #(= (fs/absolute-path segments) %) @synced))))))
+
 (deftest jvm-segment-publish-recovery-and-hardlink-guards
   (with-ledger
     (fn [{:keys [directory runtime]}]
