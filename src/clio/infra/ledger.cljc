@@ -443,7 +443,16 @@
   [path]
   (refuse-segment-symlink! path)
   (let [name (last (str/split path #"/"))
-        expected-id (some-> name segment-stem-from-filename decode-segment-stem)
+        stem (segment-stem-from-filename name)
+        expected-id (some-> stem decode-segment-stem)
+        ;; Literal uppercase UUID filenames decode, but are not the canonical
+        ;; encode-segment-stem form (`!a` escapes). Reject them so they cannot
+        ;; alias the lowercase path on case-folding filesystems.
+        _ (when (and expected-id
+                     (not= name (str (encode-segment-stem expected-id) segment-suffix)))
+            (fail! :clio.ledger/noncanonical-segment-name
+                   "Segment filename must use the canonical id encoding"
+                   {:path path :event/id expected-id}))
         events (with-segment-lock
                  fs/acquire-entry-read-lock! path true
                  #(parse-ledger-text path (fs/read-locked-text %)))]
