@@ -348,6 +348,8 @@
             {evt :event} (runtime/append! runtime path :record/observed fixture/facts)
             revisions (:schema/revisions (runtime/refresh runtime))]
         (is (= :clio.ledger/missing-directory (error-code #(ledger/segment-paths segments))))
+        (is (= :clio.ledger/missing-directory (error-code #(ledger/create-segment! revisions segments evt))))
+        (fs/ensure-dir! segments)
         (is (= :appended (ledger/create-segment! revisions segments evt)))
         (is (= :already-present (ledger/create-segment! revisions segments evt)))
         (is (= [(ledger/segment-path segments (:event/id evt))] (ledger/segment-paths segments)))

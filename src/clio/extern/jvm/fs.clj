@@ -54,6 +54,9 @@
 (defn exists? [path]
   (Files/exists (nio-path path) no-links))
 
+(defn symlink? [path]
+  (Files/isSymbolicLink (nio-path path)))
+
 (defn require-directory-sync-support!
   "Refuse, without forcing anything, when `path` is not on the supported Linux
    default POSIX filesystem. Directory FileChannels are not portable Java.

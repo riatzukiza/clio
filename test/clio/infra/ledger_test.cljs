@@ -335,8 +335,11 @@
             whole (ledger/canonicalize-files revisions [single-file])]
         (testing "a missing segment directory is an error, not an empty history"
           (is (= :clio.ledger/missing-directory
-                 (error-code #(ledger/segment-paths segments)))))
+                 (error-code #(ledger/segment-paths segments))))
+          (is (= :clio.ledger/missing-directory
+                 (error-code #(ledger/create-segment! revisions segments added)))))
         (testing "each event becomes its own content-addressed segment"
+          (fs/ensure-dir! segments)
           (is (= :appended (ledger/create-segment! revisions segments added)))
           (is (= :appended (ledger/create-segment! revisions segments opened)))
           (is (= :already-present (ledger/create-segment! revisions segments opened)))
@@ -358,6 +361,7 @@
                  (:canonical/events (runtime/canonicalize-directory rt segments [])))))
         (testing "a frozen legacy ledger is unioned as one more partition"
           (fs/remove-tree! segments)
+          (fs/ensure-dir! segments)
           (ledger/append-event! revisions legacy-file opened)
           (ledger/create-segment! revisions segments added)
           (is (= (:canonical/events whole)

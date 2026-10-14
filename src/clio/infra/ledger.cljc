@@ -177,10 +177,17 @@
 
 (defn ensure-segment-file!
   "Bring the segment file for `event-id` into being exactly once. A concurrent
-   or retried creator that finds it already present is not an error."
+   or retried creator that finds it already present is not an error. The segment
+   directory must already exist — append never silently creates a replacement
+   for a typo, deletion, or unmounted volume."
   [directory event-id]
+  (require-directory! directory)
   (let [path (segment-path directory event-id)]
-    (fs/ensure-dir! directory)
+    (when (fs/exists? path)
+      (when (fs/symlink? path)
+        (fail! :clio.ledger/segment-symlink
+               "Segment entry must not be a symbolic link"
+               {:path path})))
     (when-not (fs/exists? path)
       (try
         (create-ledger! path)
@@ -191,13 +198,55 @@
 (defn create-segment!
   "Write one validated event as its own segment. The segment is named by the
    event id, so an exact retry is :already-present and a different event with
-   the same id is an :id-collision; other segments are never touched."
+   the same id is an :id-collision; other segments are never touched. Unlike
+   ordinary ledger append, a preexisting segment never admits a second event."
   [revisions directory event]
   (schema/validate-event! revisions event)
-  (append-event! revisions (ensure-segment-file! directory (:event/id event)) event))
+  (let [path (ensure-segment-file! directory (:event/id event))
+        existing (read-existing-ledger! path)]
+    (cond
+      (empty? existing)
+      (append-event! revisions path event)
+      (= 1 (count existing))
+      (if (= (first existing) event)
+        :already-present
+        (fail! :clio.ledger/id-collision
+               "Segment already holds a different event"
+               {:path path :event/id (:event/id event)}))
+      :else
+      (fail! :clio.ledger/multi-event-segment
+             "Segment file must hold exactly one event"
+             {:path path :count (count existing)}))))
+
+(defn- require-segment-file!
+  "Each segment is one non-empty, non-symlink `*.edn` file named by its event id."
+  [_directory path]
+  (when (fs/symlink? path)
+    (fail! :clio.ledger/segment-symlink
+           "Segment entry must not be a symbolic link"
+           {:path path}))
+  (let [name (last (str/split path #"/"))
+        expected-id (when (and name (str/ends-with? name segment-suffix))
+                      (subs name 0 (- (count name) (count segment-suffix))))
+        events (read-existing-ledger! path)]
+    (when (empty? events)
+      (fail! :clio.ledger/empty-segment
+             "Segment file is empty (interrupted create?)"
+             {:path path}))
+    (when-not (= 1 (count events))
+      (fail! :clio.ledger/multi-event-segment
+             "Segment file must hold exactly one event"
+             {:path path :count (count events)}))
+    (when-not (= expected-id (:event/id (first events)))
+      (fail! :clio.ledger/segment-id-mismatch
+             "Segment filename must match its event id"
+             {:path path :event/id (:event/id (first events))}))))
 
 (defn canonicalize-directory
   "Canonicalize the extra ledger files (for example a frozen legacy ledger)
-   together with every segment in `directory`."
+   together with every segment in `directory`. Each segment is validated for
+   the one-event-per-`<event-id>.edn` format before the ordinary reader runs."
   [revisions directory extra-paths]
-  (canonicalize-files revisions (into (vec extra-paths) (segment-paths directory))))
+  (let [paths (segment-paths directory)]
+    (doseq [path paths] (require-segment-file! directory path))
+    (canonicalize-files revisions (into (vec extra-paths) paths))))

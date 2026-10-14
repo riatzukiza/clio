@@ -8,6 +8,13 @@
   [path]
   (boolean (fs/existsSync path)))
 
+(defn symlink?
+  "True when `path` is a symbolic link (lstat), whether or not the target exists."
+  [path]
+  (try
+    (.isSymbolicLink (fs/lstatSync path))
+    (catch :default _ false)))
+
 (defn absolute-path
   "Resolve the existing target through the filesystem, preserving link/.. semantics."
   [path]
