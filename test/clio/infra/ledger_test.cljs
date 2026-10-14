@@ -685,6 +685,134 @@
       (finally
         (fs/remove-tree! directory)))))
 
+
+(deftest segment-recovery-paths-are-absolute-for-relative-directories
+  (let [marker (str ".clio-segments-abs-" (host/random-uuid))
+        directory (str (process/cwd) "/" marker)
+        schema-directory (str directory "/schemas")
+        segments-name (str "segments-" (host/random-uuid))
+        segments-abs (str directory "/" segments-name)
+        segments-rel (str marker "/" segments-name)]
+    (try
+      (fs/ensure-dir! segments-abs)
+      (let [rt (runtime/open schema-directory catalog)
+            facts {:event/stream "counter:abs" :event/seq 1
+                   :event/actor "user:alice" :event/subject "counter:abs"
+                   :event/data {:amount 1}}
+            recovery (try
+                       (with-redefs [fs/append-locked-text!
+                                     (fn [_ _] (throw (ex-info "Injected append failure" {})))]
+                         (runtime/append-segment! rt segments-rel :counter/opened facts))
+                       nil
+                       (catch :default cause (:clio/append-recovery (ex-data cause))))]
+        (testing "recovery anchors the segment directory and path absolutely"
+          (is (string? (:ledger/segment-directory recovery)))
+          (is (str/starts-with? (:ledger/segment-directory recovery) "/")
+              "recovery directory must be absolute for restart-safe retry")
+          (is (not= segments-rel (:ledger/segment-directory recovery))
+              "relative spelling must not be preserved")
+          (is (str/ends-with? (:ledger/segment-directory recovery) segments-name))
+          (is (str/starts-with? (:ledger/path recovery)
+                                (:ledger/segment-directory recovery))))
+        (testing "missing relative directories still absolute in recovery"
+          (let [missing-rel (str segments-rel "-missing")
+                cause (try
+                        (runtime/append-segment! rt missing-rel :counter/opened facts)
+                        nil
+                        (catch :default e e))
+                missing-recovery (:clio/append-recovery (ex-data cause))]
+            (is (= :clio.ledger/missing-directory (:clio/error (ex-data cause))))
+            (is (str/starts-with? (:ledger/segment-directory missing-recovery) "/"))
+            (is (not= missing-rel (:ledger/segment-directory missing-recovery))))))
+      (finally
+        (fs/remove-tree! directory)))))
+
+(deftest ensure-segment-file-propagates-post-creation-durability-failures
+  (let [directory (str "/tmp/clio-segments-ensure-" (host/random-uuid))
+        schema-directory (str directory "/schemas")
+        segments (str directory "/segments")]
+    (try
+      (fs/ensure-dir! segments)
+      (let [rt (runtime/open schema-directory catalog)
+            event (event/make-event (:schema/current rt) :counter/opened
+                                    {:event/stream "counter:e" :event/seq 1
+                                     :event/actor "user:alice" :event/subject "counter:e"
+                                     :event/data {:amount 1}})
+            path (ledger/segment-path segments (:event/id event))
+            real-create! fs/create-exclusive!]
+        (with-redefs [fs/create-exclusive!
+                      (fn [p]
+                        (real-create! p)
+                        (throw (ex-info "Injected post-create parent sync failure"
+                                        {:clio/error :clio.fs/directory-sync-unavailable
+                                         :path p})))]
+          (is (= :clio.fs/directory-sync-unavailable
+                 (error-code #(ledger/ensure-segment-file! segments (:event/id event))))
+              "a post-creation durability failure must not be swallowed when the file exists")
+          (is (fs/exists? path) "the nondurable entry may remain, but must not be acknowledged")))
+      (finally
+        (fs/remove-tree! directory)))))
+
+(deftest segment-filenames-preserve-case-variant-event-ids
+  (let [directory (str "/tmp/clio-segments-case-" (host/random-uuid))
+        schema-directory (str directory "/schemas")
+        segments (str directory "/segments")
+        single-file (str directory "/events.edn")
+        lower "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+        upper "AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE"]
+    (try
+      (fs/ensure-dir! segments)
+      (ledger/create-ledger! single-file)
+      (let [rt (runtime/open schema-directory catalog)
+            revisions (:schema/revisions (runtime/refresh rt))
+            make (fn [id stream amount]
+                   (assoc (event/make-event (:schema/current rt) :counter/opened
+                                            {:event/stream stream :event/seq 1
+                                             :event/actor "user:alice" :event/subject stream
+                                             :event/data {:amount amount}})
+                          :event/id id))
+            e-lower (make lower "counter:lo" 1)
+            e-upper (make upper "counter:up" 2)
+            lower-name (last (str/split (ledger/segment-path segments lower) #"/"))
+            upper-name (last (str/split (ledger/segment-path segments upper) #"/"))]
+        (testing "filenames for case-variant ids stay distinct under case folding"
+          (is (not= (str/lower-case lower-name) (str/lower-case upper-name))))
+        (testing "partition equivalence holds for both case variants"
+          (is (= :appended (ledger/append-event! revisions single-file e-lower)))
+          (is (= :appended (ledger/append-event! revisions single-file e-upper)))
+          (is (= :appended (ledger/create-segment! revisions segments e-lower)))
+          (is (= :appended (ledger/create-segment! revisions segments e-upper)))
+          (is (= (:canonical/events (ledger/canonicalize-files revisions [single-file]))
+                 (:canonical/events (ledger/canonicalize-directory revisions segments []))))))
+      (finally
+        (fs/remove-tree! directory)))))
+
+(deftest unpublished-creating-temps-are-reclaimed-before-retry
+  (let [directory (str "/tmp/clio-segments-orphan-" (host/random-uuid))
+        schema-directory (str directory "/schemas")
+        segments (str directory "/segments")]
+    (try
+      (fs/ensure-dir! segments)
+      (let [rt (runtime/open schema-directory catalog)
+            revisions (:schema/revisions (runtime/refresh rt))
+            event (event/make-event (:schema/current rt) :counter/opened
+                                    {:event/stream "counter:or" :event/seq 1
+                                     :event/actor "user:alice" :event/subject "counter:or"
+                                     :event/data {:amount 3}})
+            path (ledger/segment-path segments (:event/id event))
+            stem (subs (last (str/split path #"/")) 0
+                       (- (count (last (str/split path #"/"))) (count ".edn")))
+            orphan (str segments "/." stem ".creating-" (host/random-uuid))]
+        (ledger/create-ledger! orphan)
+        (is (seq (creating-entries segments)) "precondition: an unpublished temp remains")
+        (is (not (fs/exists? path)))
+        (is (= :appended (ledger/create-segment! revisions segments event)))
+        (is (= [event] (:canonical/events (ledger/canonicalize-directory revisions segments []))))
+        (is (= [] (creating-entries segments))
+            "an interrupted pre-publish temp must not survive a later successful publish"))
+      (finally
+        (fs/remove-tree! directory)))))
+
 (deftest concurrent-processes-publish-one-segment
   (async done
     (let [directory (str "/tmp/clio-segments-race-" (host/random-uuid))

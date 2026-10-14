@@ -510,3 +510,95 @@
             (fs/delete-if-exists! unrelated)
             (is (= 2 (count (:canonical/events
                              (ledger/canonicalize-directory revisions segments [])))))))))))
+
+(deftest jvm-segment-recovery-paths-are-absolute-for-relative-directories
+  (let [marker (str ".clio-jvm-seg-abs-" (host/random-uuid))
+        directory (str (System/getProperty "user.dir") "/" marker)
+        schemas (str directory "/schemas")
+        segments-name (str "segments-" (host/random-uuid))
+        segments-abs (str directory "/" segments-name)
+        segments-rel (str marker "/" segments-name)]
+    (try
+      (fs/ensure-dir! segments-abs)
+      (let [runtime (runtime/open schemas fixture/catalog)
+            facts (assoc fixture/facts :event/stream "record:abs" :event/subject "record:abs")
+            recovery (try
+                       (with-redefs [fs/append-locked-text!
+                                     (fn [_ _] (throw (ex-info "Injected append failure" {})))]
+                         (runtime/append-segment! runtime segments-rel :record/observed facts))
+                       nil
+                       (catch Exception cause (:clio/append-recovery (ex-data cause))))]
+        (is (string? (:ledger/segment-directory recovery)))
+        (is (str/starts-with? (:ledger/segment-directory recovery) "/"))
+        (is (not= segments-rel (:ledger/segment-directory recovery)))
+        (is (str/ends-with? (:ledger/segment-directory recovery) segments-name))
+        (is (str/starts-with? (:ledger/path recovery)
+                              (:ledger/segment-directory recovery))))
+      (finally (fs/remove-tree! directory)))))
+
+(deftest jvm-ensure-segment-file-propagates-post-creation-durability-failures
+  (with-ledger
+    (fn [{:keys [directory runtime]}]
+      (let [segments (str directory "/segments")
+            event (event/make-event (:schema/current runtime) :record/observed fixture/facts)
+            path (ledger/segment-path segments (:event/id event))
+            real-force! fs/force-file!
+            real-sync! fs/sync-directory!
+            file-forced? (atom false)]
+        (fs/ensure-dir! segments)
+        (with-redefs [fs/force-file! (fn [channel]
+                                       (reset! file-forced? true)
+                                       (real-force! channel))
+                      fs/sync-directory! (fn [p]
+                                           (if @file-forced?
+                                             (throw (ex-info "Injected parent sync failure"
+                                                             {:clio/error :clio.fs/directory-sync-unavailable
+                                                              :path p}))
+                                             (real-sync! p)))]
+          (is (= :clio.fs/directory-sync-unavailable
+                 (error-code #(ledger/ensure-segment-file! segments (:event/id event)))))
+          (is (fs/exists? path)))))))
+
+(deftest jvm-segment-filenames-preserve-case-variant-event-ids
+  (with-ledger
+    (fn [{:keys [directory runtime]}]
+      (let [segments (str directory "/segments")
+            single (str directory "/both.edn")
+            lower "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+            upper "AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE"
+            revisions (:schema/revisions (runtime/refresh runtime))
+            make (fn [id stream]
+                   (assoc (event/make-event (:schema/current runtime) :record/observed
+                                            (assoc fixture/facts :event/stream stream
+                                                   :event/subject stream))
+                          :event/id id))
+            e-lower (make lower "record:lo")
+            e-upper (make upper "record:up")
+            lower-name (last (str/split (ledger/segment-path segments lower) #"/"))
+            upper-name (last (str/split (ledger/segment-path segments upper) #"/"))]
+        (fs/ensure-dir! segments)
+        (ledger/create-ledger! single)
+        (is (not= (str/lower-case lower-name) (str/lower-case upper-name)))
+        (is (= :appended (ledger/append-event! revisions single e-lower)))
+        (is (= :appended (ledger/append-event! revisions single e-upper)))
+        (is (= :appended (ledger/create-segment! revisions segments e-lower)))
+        (is (= :appended (ledger/create-segment! revisions segments e-upper)))
+        (is (= (:canonical/events (ledger/canonicalize-files revisions [single]))
+               (:canonical/events (ledger/canonicalize-directory revisions segments []))))))))
+
+(deftest jvm-unpublished-creating-temps-are-reclaimed-before-retry
+  (with-ledger
+    (fn [{:keys [directory runtime]}]
+      (let [segments (str directory "/segments")
+            revisions (:schema/revisions (runtime/refresh runtime))
+            event (event/make-event (:schema/current runtime) :record/observed fixture/facts)
+            path (ledger/segment-path segments (:event/id event))
+            name (last (str/split path #"/"))
+            stem (subs name 0 (- (count name) (count ".edn")))
+            orphan (str segments "/." stem ".creating-" (host/random-uuid))]
+        (fs/ensure-dir! segments)
+        (ledger/create-ledger! orphan)
+        (is (seq (creating-entries segments)))
+        (is (not (fs/exists? path)))
+        (is (= :appended (ledger/create-segment! revisions segments event)))
+        (is (= [] (creating-entries segments)))))))
