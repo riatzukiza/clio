@@ -12,10 +12,16 @@
   []
   (js/Date.now))
 
+(def ^:private sleep-cell
+  (js/Int32Array. (js/SharedArrayBuffer. 4)))
+
 (defn sleep-ms!
+  "Synchronously wait `ms` without spinning: Atomics.wait parks the thread on a
+   private cell that is never notified, so the retry backoff uses no CPU."
   [ms]
-  (let [end (+ (js/Date.now) ms)]
-    (while (< (js/Date.now) end))))
+  (when (pos? ms)
+    (js/Atomics.wait sleep-cell 0 0 ms))
+  nil)
 
 (defn symlink?
   "True when `path` is a symbolic link (lstat), whether or not the target exists."

@@ -93,12 +93,25 @@
     ;; A descriptor closed during the scan (or an unreadable entry) is not ours.
     (catch Exception _ nil)))
 
+(def ^:private fd-tag-min
+  "Lowest fdinfo position tag (2^24): far above the offsets ordinary small
+   files reach."
+  (bit-shift-left 1 24))
+
+(def ^:private fd-tag-max
+  "Exclusive upper bound for the fdinfo position tag (2^31). It stays below
+   vfat's 0xffffffff s_maxbytes and ext4's 1 KiB-block indirect limit (~2^34),
+   the smallest common Linux limits, where a larger lseek fails with EINVAL."
+  (bit-shift-left 1 31))
+
 (defn- channel-fd-int
   "OS file descriptor number owned by an open FileChannel, without reflection.
 
    The channel's file position is a property of its own open file description,
-   so a random position in [2^33, 2^40) tags it (below ext4's 16 TiB
-   s_maxbytes, where lseek would fail with EINVAL; far above ordinary offsets). /proc/self/fdinfo reports each
+   so a random position in [fd-tag-min, fd-tag-max) = [2^24, 2^31) tags it
+   (below the smallest common s_maxbytes, vfat's 0xffffffff, where lseek would
+   fail with EINVAL). A coincident position on another descriptor yields two
+   matches and fails closed. /proc/self/fdinfo reports each
    descriptor's position; exactly one descriptor carries the tag. The original
    position is restored. No JVM module opens are needed, so :local/root
    consumers work unchanged. Without Linux /proc the identity check fails closed."
@@ -109,7 +122,7 @@
                      (throw (ex-info "Opened entry is not a seekable regular file"
                                      {:clio/error :clio.fs/entry-replaced} cause))))
         tag (.nextLong (java.util.concurrent.ThreadLocalRandom/current)
-                       (bit-shift-left 1 33) (bit-shift-left 1 40))]
+                       (long fd-tag-min) (long fd-tag-max))]
     (try
       (.position channel (long tag))
       (let [matches (try
@@ -526,36 +539,39 @@
    is missing, locked by another holder, multiply linked, or unavailable."
   [path]
   (.lock process-guard)
-  (try
-    (let [target-path (entry-path path)
-          links nofollow-links]
-      (when (Files/exists (nio-path target-path) nofollow-links)
-        (let [key (file-key target-path links)]
-          (when-not (some #(= key (:file/key %)) (vals @active-locks))
-            (let [options (into-array OpenOption [StandardOpenOption/READ
-                                                  StandardOpenOption/WRITE
-                                                  LinkOption/NOFOLLOW_LINKS])
-                  channel (FileChannel/open (nio-path target-path) options)]
-              (try
-                (let [lock (.tryLock channel 0 Long/MAX_VALUE false)]
-                  (if (nil? lock)
-                    (do (.close channel) nil)
-                    (if (not= 1 (link-count path target-path links))
-                      (do (.release lock) (.close channel) nil)
-                      (let [token (str (UUID/randomUUID))]
-                        (swap! active-locks assoc token
-                               {:channel channel :file-lock lock :file/key key
-                                :path path :target-path target-path})
-                        {:lock/id token :lock/path path}))))
-                (catch Throwable cause
-                  (.close channel)
-                  (throw cause))))))))
-    (catch Exception _
-      nil)
-    (finally
-      ;; release-lock! unlocks process-guard; if we return a lock, keep it held.
-      (let [held (some (fn [[_ v]] (= path (:path v))) @active-locks)]
-        (when-not held
+  (let [created? (volatile! false)]
+    (try
+      (let [target-path (entry-path path)
+            links nofollow-links]
+        (when (Files/exists (nio-path target-path) nofollow-links)
+          (let [key (file-key target-path links)]
+            (when-not (some #(= key (:file/key %)) (vals @active-locks))
+              (let [options (into-array OpenOption [StandardOpenOption/READ
+                                                    StandardOpenOption/WRITE
+                                                    LinkOption/NOFOLLOW_LINKS])
+                    channel (FileChannel/open (nio-path target-path) options)]
+                (try
+                  (let [lock (.tryLock channel 0 Long/MAX_VALUE false)]
+                    (if (nil? lock)
+                      (do (.close channel) nil)
+                      (if (not= 1 (link-count path target-path links))
+                        (do (.release lock) (.close channel) nil)
+                        (let [token (str (UUID/randomUUID))]
+                          (swap! active-locks assoc token
+                                 {:channel channel :file-lock lock :file/key key
+                                  :path path :target-path target-path})
+                          (vreset! created? true)
+                          {:lock/id token :lock/path path}))))
+                  (catch Throwable cause
+                    (.close channel)
+                    (throw cause))))))))
+      (catch Exception _
+        nil)
+      (finally
+        ;; release-lock! unlocks process-guard once for the token this call
+        ;; returns; every other outcome (including a path this thread already
+        ;; owns) drops the hold taken above.
+        (when-not @created?
           (.unlock process-guard))))))
 
 (defn acquire-entry-read-lock!

@@ -293,6 +293,11 @@
   [directory event-id]
   (str directory "/." (encode-segment-stem event-id) creating-marker (random-uuid)))
 
+(def ^:private generated-temp-uuid
+  "The only suffix publish-temp-path emits: host random-uuid, a lowercase
+   version-4 RFC 4122 UUID."
+  #"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}")
+
 (defn- publish-temp-basename?
   "True when `name` is exactly `.<stem>.creating-<uuid>` — the grammar
    publish-temp-path emits. Prefix-only matching would reclaim operator backups
@@ -301,7 +306,7 @@
   (let [prefix (str "." stem creating-marker)]
     (and (string? name)
          (str/starts-with? name prefix)
-         (event-law/uuid-string? (subs name (count prefix))))))
+         (some? (re-matches generated-temp-uuid (subs name (count prefix)))))))
 
 (defn- stale-publish-aliases
   "Name the hidden publish temps of the segment at `path` (`.<stem>.creating-*`
