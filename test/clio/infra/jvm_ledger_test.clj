@@ -937,3 +937,25 @@
                   (fn [_]
                     (java.nio.file.Files/createLink (java.nio.file.Paths/get alias (make-array String 0)) (java.nio.file.Paths/get segment (make-array String 0)))
                     :ok)))))))))
+
+(deftest jvm-ensure-segment-file-binds-directory-across-symlink-retarget
+  ;; A retarget between the existence check and creation must not create the
+  ;; segment in another store.
+  (with-ledger
+    (fn [{:keys [directory runtime]}]
+      (let [a (str directory "/a") b (str directory "/b") link (str directory "/link")
+            p (fn [s] (java.nio.file.Paths/get s (make-array String 0)))
+            event (event/make-event (:schema/current runtime) :record/observed fixture/facts)
+            name (last (str/split (ledger/segment-path a (:event/id event)) #"/"))
+            create! ledger/create-ledger!]
+        (fs/ensure-dir! a)
+        (fs/ensure-dir! b)
+        (java.nio.file.Files/createSymbolicLink (p link) (p a) (make-array java.nio.file.attribute.FileAttribute 0))
+        (with-redefs [ledger/create-ledger!
+                      (fn [path]
+                        (java.nio.file.Files/delete (p link))
+                        (java.nio.file.Files/createSymbolicLink (p link) (p b) (make-array java.nio.file.attribute.FileAttribute 0))
+                        (create! path))]
+          (try (ledger/ensure-segment-file! link (:event/id event)) (catch Exception _ nil)))
+        (is (not (.exists (java.io.File. (str b "/" name))))
+            "segment must not be created in the retargeted store")))))
