@@ -1,0 +1,32 @@
+#!/usr/bin/env nbb
+
+;; One real process racing to publish a segment: prints the create-segment!
+;; outcome or the :clio/error it failed with, after a shared start time.
+(ns clio.infra.segment-worker
+  (:require [clio.domain.schema :as schema]
+            [clio.extern.js.crypto :as crypto]
+            [clio.extern.js.process :as process]
+            [clio.infra.ledger :as ledger]
+            [clio.law.schema :as schema-law]
+            [clio.shape.edn :as edn]))
+
+(def catalog
+  {:counter/opened
+   (schema-law/event-schema
+    :counter/opened
+    [:map {:closed true} [:amount :int]])
+   :counter/added
+   (schema-law/event-schema
+    :counter/added
+    [:map {:closed true} [:amount :int]])})
+
+(let [[directory event-text start-at-text] *command-line-args*
+      revision (schema/materialize crypto/sha256 catalog)
+      event (edn/read-one event-text)
+      start-at (edn/read-one start-at-text)]
+  (process/sleep-until! start-at)
+  (try
+    (println (pr-str {:result (ledger/create-segment! [revision] directory event)}))
+    (catch :default cause
+      (println (pr-str {:error (:clio/error (ex-data cause))}))
+      (process/exit! 1))))

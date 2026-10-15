@@ -12,7 +12,9 @@
   (println "clio schema-root <catalog.edn>")
   (println "clio append <schema-dir> <catalog.edn> <ledger.edn> <:schema/id> '<event-edn>'")
   (println "clio retry-append <schema-dir> '<append-recovery-edn>'")
-  (println "clio canonicalize <schema-dir> <ledger.edn> [ledger.edn ...]"))
+  (println "clio canonicalize <schema-dir> <ledger.edn> [ledger.edn ...]")
+  (println "clio append-segment <schema-dir> <catalog.edn> <segment-dir> <:schema/id> '<event-edn>'")
+  (println "clio canonicalize-dir <schema-dir> <segment-dir> [legacy-ledger.edn ...]"))
 
 (defn- read-edn-file [path]
   (edn/read-one (fs/read-text path)))
@@ -43,6 +45,22 @@
   (let [canonical (runtime/canonicalize-files {:schema/directory schema-dir} ledger-files)]
     (prn (select-keys canonical [:canonical/event-ids :canonical/events]))))
 
+(defn- command-append-segment [[schema-dir catalog-file segment-dir schema-id-edn event-edn]]
+  (let [catalog-value (read-edn-file catalog-file)
+        schema-id-value (edn/read-one schema-id-edn)
+        event-data-value (edn/read-one event-edn)
+        catalog (cli-law/validate! cli-law/catalog catalog-value {:input :catalog})
+        schema-id (cli-law/validate! cli-law/schema-id schema-id-value {:input :schema-id})
+        event-data (cli-law/validate! cli-law/event-data event-data-value {:input :event-data})
+        rt (runtime/open schema-dir catalog)
+        result (runtime/append-segment! rt segment-dir schema-id event-data)]
+    (prn (select-keys result [:append/result :event]))))
+
+(defn- command-canonicalize-dir [[schema-dir segment-dir & legacy-files]]
+  (let [canonical (runtime/canonicalize-directory {:schema/directory schema-dir}
+                                                  segment-dir legacy-files)]
+    (prn (select-keys canonical [:canonical/event-ids :canonical/events]))))
+
 (defn- command-retry-append [[schema-dir recovery-edn]]
   (let [result (runtime/retry-append! {:schema/directory schema-dir} (edn/read-one recovery-edn))]
     (prn (select-keys result [:append/result :event]))))
@@ -61,4 +79,6 @@
       :schema-root (command-schema-root command-args)
       :append (command-append command-args)
       :retry-append (command-retry-append command-args)
-      :canonicalize (command-canonicalize command-args))))
+      :canonicalize (command-canonicalize command-args)
+      :append-segment (command-append-segment command-args)
+      :canonicalize-dir (command-canonicalize-dir command-args))))

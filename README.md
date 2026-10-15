@@ -36,6 +36,45 @@ uses `[stream-id, stream-seq, event-id]` only as a deterministic replay tie-brea
 for graph-incomparable events; domain code must not mistake that tie-break for a
 causal claim.
 
+## Segment directories
+
+A ledger may also be stored as a directory of immutable segments, one event per
+file, named from the event id. Lowercase UUID ids keep the plain `<event-id>.edn`
+spelling; uppercase letters are encoded as `!<lower>` so case-variant ids stay
+distinct on case-folding filesystems. Segment names admit exactly the ids an
+ordinary ledger admits. Because partitioning has no semantic authority,
+a segment directory (optionally unioned with a frozen legacy ledger file)
+canonicalizes exactly like the same events in one file, and branches that each
+add segments merge without textual conflicts.
+
+```bash
+clio append-segment <schema-dir> <catalog.edn> <segment-dir> <:schema/id> '<event-edn>'
+clio canonicalize-dir <schema-dir> <segment-dir> [legacy-ledger.edn ...]
+```
+
+`clio.infra.ledger/segment-paths`, `create-segment!` and
+`canonicalize-directory` (plus `clio.infra.runtime/append-segment!` and
+`canonicalize-directory`) are the library surface. An exact retry is
+`:already-present`; different data under an existing id is an `:id-collision`;
+a missing directory (or one that vanishes during enumeration) is an error, never
+an empty history. Both the library and the `canonicalize-dir` command reject an
+empty segment, a multi-event segment, and a filename/event-id mismatch, and
+canonicalize the validated snapshots rather than rereading them. Segment entries
+are opened without following symlinks, so a symlink swapped in after a check is
+refused instead of read or written outside the directory; an exact retry
+repeats the file and directory durability fences before `:already-present`.
+A new segment is written to a hidden `.<stem>.creating-*` temp (stem matching
+the segment filename) and
+published by exclusive hard link; the temp is removed before the directory
+fence. If a publisher stops between the link and that removal, the next reader
+or writer holding the segment's lock removes the temp alias of the same inode
+and forces the directory, so the segment is not left permanently refused as a
+hard link. Any other extra link is still refused.
+Canonical order is
+still the causal/stream order above. Clio does not consult git: checking that
+committed segments were never edited or removed belongs to the caller (eta-mu's
+receipt/ledger commands).
+
 ## Event shape
 
 There is deliberately no hand-maintained `:event/version` integer.
@@ -265,6 +304,17 @@ Unsupported hosts or failed directory forces raise
 `:clio.fs/directory-sync-unavailable`; no successful schema publication is
 reported. A force failure after the move can leave the new path present, but
 the caller still receives failure and must not acknowledge dependent events.
+
+JVM segment-entry locks bind their checks to the opened descriptor's inode
+through Linux `/proc/self/fdinfo` and `/proc/self/fd`, without reflection, so
+JVM consumers (including `:local/root` dependencies, which inherit no Clio
+aliases) need no `--add-opens` or other JVM options. Shared entry locks open
+READ+WRITE (Linux never blocks an `O_RDWR` FIFO open; the token still refuses
+writes), so a FIFO swapped in after the type check is refused at once. Only an
+entry the process cannot write falls back to a READ open bounded by
+`clio.extern.jvm.fs/*entry-open-timeout-ms*`; it fails closed with
+`:clio.fs/entry-open-blocked`, and while `*max-stuck-entry-opens*` abandoned
+opens are still blocked, further fallback opens refuse immediately.
 The Node adapter resynchronizes existing ancestry on retry, including directories
 left present by a previously refused force. Tests observe real filesystem calls,
 inject file and directory synchronization failures, and verify that no dependent
