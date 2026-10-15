@@ -16,6 +16,12 @@
   []
   (.cwd js/process))
 
+(defn cpu-time-ms
+  "User plus system CPU time this process has consumed, in milliseconds."
+  []
+  (let [usage (js/process.cpuUsage)]
+    (/ (+ (.-user usage) (.-system usage)) 1000)))
+
 (defn now-ms
   []
   (js/Date.now))
