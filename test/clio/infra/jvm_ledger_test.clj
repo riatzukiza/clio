@@ -879,3 +879,20 @@
   (let [lo (some-> (resolve 'clio.extern.jvm.fs/fd-tag-min) deref)
         hi (some-> (resolve 'clio.extern.jvm.fs/fd-tag-max) deref)]
     (is (and lo hi (< 0 lo hi 0xffffffff)) "position tag range must stay below 2^32 - 1")))
+
+(deftest jvm-append-segment-refuses-unresolvable-existing-directory
+  ;; Only a confirmed missing path may use the lexical (symlink-spelling)
+  ;; recovery; EACCES/ELOOP/I/O failures must fail before an event exists.
+  (with-ledger
+    (fn [{:keys [directory runtime]}]
+      (let [segments (str directory "/segments")
+            _ (fs/ensure-dir! segments)
+            outcome (try
+                      (with-redefs [fs/absolute-path
+                                    (fn [p] (throw (java.nio.file.AccessDeniedException. p)))]
+                        (runtime/append-segment! runtime segments :record/observed fixture/facts))
+                      :no-error
+                      (catch Exception cause cause))]
+        (is (instance? Exception outcome))
+        (is (not (contains? (ex-data outcome) :clio/append-recovery))
+            "no recovery token (no event) for a non-missing resolution failure")))))
