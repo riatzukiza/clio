@@ -391,12 +391,15 @@
    lock rather than exposing an empty unlocked entry that canonicalization
    could observe as `:clio.ledger/empty-segment`."
   [directory event-id]
-  (require-directory! directory)
-  (let [path (segment-path directory event-id)]
+  ;; Resolve and identity-bind the directory once, like create-segment!, so a
+  ;; symlink retarget or rename+replace cannot redirect creation elsewhere.
+  (let [[directory identity] (bind-segment-directory! directory)
+        path (segment-path directory event-id)]
     (refuse-segment-symlink! path)
     (when-not (fs/exists? path)
       (try
         (create-ledger! path)
+        (ensure-bound-directory! directory identity)
         (catch #?(:clj Exception :cljs :default) cause
           (refuse-segment-symlink! path)
           ;; Only a concurrent creator's already-exists race is success. A
