@@ -896,3 +896,28 @@
         (is (instance? Exception outcome))
         (is (not (contains? (ex-data outcome) :clio/append-recovery))
             "no recovery token (no event) for a non-missing resolution failure")))))
+
+(deftest jvm-interrupted-bounded-open-is-abandoned-and-counted
+  ;; An interrupt while waiting must take the same abandonment path as a
+  ;; timeout, so the stuck-open cap still applies and a late channel is closed.
+  (let [directory (str "/tmp/clio-jvm-fifo-" (host/random-uuid))
+        fifo (str directory "/entry.edn")
+        stuck @#'fs/stuck-entry-opens
+        before @stuck]
+    (try
+      (fs/ensure-dir! directory)
+      (is (zero? (.waitFor (.start (ProcessBuilder. ^java.util.List ["mkfifo" fifo])))))
+      (let [options (into-array java.nio.file.OpenOption [java.nio.file.StandardOpenOption/READ])
+            outcome (try
+                      (.interrupt (Thread/currentThread))
+                      (#'fs/open-entry-bounded! fifo options fifo)
+                      :opened
+                      (catch Throwable cause cause)
+                      (finally (Thread/interrupted)))]
+        (is (instance? Throwable outcome))
+        (is (= (inc before) @stuck) "interrupted wait must count as a stuck open"))
+      (finally
+        ;; Release the blocked reader so the late channel closes and the count drops.
+        (try (with-open [_ (java.io.FileOutputStream. fifo)]) (catch Exception _ nil))
+        (loop [n 0] (when (and (< n 100) (not= before @stuck)) (Thread/sleep 20) (recur (inc n))))
+        (fs/remove-tree! directory)))))
