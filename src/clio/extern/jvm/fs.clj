@@ -387,7 +387,19 @@
                  (.setDaemon true)
                  (.setName "clio-entry-open")
                  (.start))]
-    (.join worker (long *entry-open-timeout-ms*))
+    (try
+      (.join worker (long *entry-open-timeout-ms*))
+      (catch InterruptedException cause
+        ;; Same abandonment path as a timeout: count the stuck open so the cap
+        ;; still applies, and let the worker close a late channel. If the open
+        ;; finished first, close that unclaimed channel here.
+        (when-not (compare-and-set! state ::waiting ::abandoned)
+          (when-let [^FileChannel early (:channel @state)]
+            (.lock process-guard)
+            (try (.close early) (finally (.unlock process-guard)))))
+        (when (= ::abandoned @state) (swap! stuck-entry-opens inc))
+        (.interrupt (Thread/currentThread))
+        (throw cause)))
     (if (compare-and-set! state ::waiting ::abandoned)
       (do (swap! stuck-entry-opens inc)
           (throw (ex-info "Directory entry open did not complete; refusing a special-file swap"
