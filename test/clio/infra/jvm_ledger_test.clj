@@ -921,3 +921,19 @@
         (try (with-open [_ (java.io.FileOutputStream. fifo)]) (catch Exception _ nil))
         (loop [n 0] (when (and (< n 100) (not= before @stuck)) (Thread/sleep 20) (recur (inc n))))
         (fs/remove-tree! directory)))))
+
+(deftest jvm-segment-lock-rechecks-link-count-before-release
+  ;; A hard link added while the segment lock is held must not let the
+  ;; operation succeed and acknowledge a now multiply linked segment.
+  (with-ledger
+    (fn [{:keys [directory]}]
+      (let [segment (str directory "/seg.edn")
+            alias (str directory "/alias.edn")]
+        (ledger/create-ledger! segment)
+        (is (= :clio.ledger/segment-hardlink
+               (error-code
+                #(#'ledger/with-segment-lock
+                  fs/acquire-entry-lock! segment false
+                  (fn [_]
+                    (java.nio.file.Files/createLink (java.nio.file.Paths/get alias (make-array String 0)) (java.nio.file.Paths/get segment (make-array String 0)))
+                    :ok)))))))))
