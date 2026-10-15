@@ -95,13 +95,18 @@
 (defn- recovery-directory
   "Anchor recovery to the directory's real path when it exists, so a symlink
    retarget before retry-append! cannot redirect the write. Fall back to an
-   absolute-lexical spelling only when resolution fails (for example the
-   directory vanished between the caller check and recovery construction)."
+   absolute-lexical spelling only when resolution fails because the path is
+   confirmed missing (for example the directory vanished between the caller
+   check and recovery construction). Any other failure (EACCES, a symlink
+   loop, an I/O error) is rethrown before an event exists, since a lexical
+   symlink spelling could later resolve to a different store."
   [directory]
   (try
     (fs/absolute-path directory)
-    (catch #?(:clj Exception :cljs :default) _
-      (fs/absolute-lexical-path directory))))
+    (catch #?(:clj Exception :cljs :default) cause
+      (if (fs/missing-path-error? cause)
+        (fs/absolute-lexical-path directory)
+        (throw cause)))))
 
 (defn append-segment!
   "Create one event and write it as its own segment file in `directory`.
@@ -111,7 +116,8 @@
    runs inside the recovery-wrapping path so callers always receive the
    already-generated event. When `directory` exists, recovery uses its real path
    so a symlink retarget cannot redirect a retry; lexical absolute spelling is
-   reserved for the case where resolution fails."
+   reserved for a confirmed-missing directory; other resolution failures throw
+   before an event is generated."
   [runtime directory schema-id event-data]
   ;; Refuse before any event exists: resolving "" would name the working
   ;; directory, and there is nothing to recover yet.
