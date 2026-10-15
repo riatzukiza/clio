@@ -8,6 +8,15 @@
   [path]
   (boolean (fs/existsSync path)))
 
+(defn now-ms
+  []
+  (js/Date.now))
+
+(defn sleep-ms!
+  [ms]
+  (let [end (+ (js/Date.now) ms)]
+    (while (< (js/Date.now) end))))
+
 (defn symlink?
   "True when `path` is a symbolic link (lstat), whether or not the target exists."
   [path]

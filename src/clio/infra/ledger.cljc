@@ -463,10 +463,16 @@
                               :else (throw cause))))]
                     ;; A same-user process may have linked the temp after the
                     ;; one-link check; never acknowledge a multiply linked segment.
+                    ;; Sweep any same-inode creating aliases first — a concurrent
+                    ;; loser's observation window can otherwise race the check.
                     (when (and (= :appended published) (not= 1 (fs/locked-link-count lock)))
-                      (fail! :clio.ledger/segment-hardlink
-                             "Segment gained a hard link during publication"
-                             {:path path}))
+                      (doseq [alias ((stale-publish-aliases path))]
+                        (fs/delete-if-exists! alias))
+                      (fs/sync-directory! directory)
+                      (when (not= 1 (fs/locked-link-count lock))
+                        (fail! :clio.ledger/segment-hardlink
+                               "Segment gained a hard link during publication"
+                               {:path path})))
                     published)))
               (catch #?(:clj Exception :cljs :default) cause
                 (if (claim-lost-to-winner? cause path)
@@ -479,6 +485,29 @@
         (if (claim-lost-to-winner? cause path)
           ::claim-lost
           (throw cause))))))
+
+(defn- admit-existing-segment!
+  "Admit against a final segment that already exists. A concurrent winner may
+   still be inside the hard-link→unlink window (nlink 2); if acquire sees that
+   as :segment-hardlink, wait briefly and retry until the winner finishes or
+   the deadline elapses. A lasting extra link still fails closed."
+  [path event]
+  (let [deadline (+ (fs/now-ms) 10000)]
+    (loop []
+      (let [outcome
+            (try
+              (with-segment-lock
+                fs/acquire-entry-lock! path true
+                #(admit-locked-segment! % path event))
+              (catch #?(:clj Exception :cljs :default) cause
+                (if (and (= :clio.ledger/segment-hardlink
+                            (:clio/error (ex-data cause)))
+                         (< (fs/now-ms) deadline))
+                  ::retry
+                  (throw cause))))]
+        (if (= ::retry outcome)
+          (do (fs/sleep-ms! 5) (recur))
+          outcome)))))
 
 (defn create-segment!
   "Write one validated event as its own segment. The segment is named by the
@@ -497,17 +526,24 @@
     (ensure-bound-directory! directory identity)
     (refuse-segment-symlink! path)
     (let [outcome
-          (if (fs/exists? path)
-            (with-segment-lock
-              fs/acquire-entry-lock! path true
-              #(admit-locked-segment! % path event))
-            (do (ensure-bound-directory! directory identity)
-                (let [published (publish-new-segment! directory path event identity)]
-                  (if (= ::claim-lost published)
-                    (with-segment-lock
-                      fs/acquire-entry-lock! path true
-                      #(admit-locked-segment! % path event))
-                    published))))]
+          (try
+            (if (fs/exists? path)
+              (admit-existing-segment! path event)
+              (do (ensure-bound-directory! directory identity)
+                  (let [published (publish-new-segment! directory path event identity)]
+                    (if (= ::claim-lost published)
+                      (admit-existing-segment! path event)
+                      published))))
+            (catch #?(:clj Exception :cljs :default) cause
+              ;; A concurrent winner may still hold a second link in the
+              ;; publish window, or our own post-publish check may observe it.
+              ;; When the final name exists, admit against it instead of
+              ;; surfacing a transient :segment-hardlink to the caller.
+              (if (and (= :clio.ledger/segment-hardlink
+                          (:clio/error (ex-data cause)))
+                       (fs/exists? path))
+                (admit-existing-segment! path event)
+                (throw cause))))]
       ;; publish-new-segment! already sweeps after a fresh claim; retries that
       ;; find the final name still clear any leftover creating temps.
       (ensure-bound-directory! directory identity)

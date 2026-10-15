@@ -51,6 +51,14 @@
 (defn missing-path-error? [cause]
   (instance? NoSuchFileException cause))
 
+(defn now-ms
+  []
+  (System/currentTimeMillis))
+
+(defn sleep-ms!
+  [ms]
+  (Thread/sleep ms))
+
 (defn already-exists-error? [cause]
   (instance? java.nio.file.FileAlreadyExistsException cause))
 
