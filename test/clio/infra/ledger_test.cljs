@@ -941,3 +941,15 @@
         (catch :default cause
           (is false (str "concurrent segment setup failed: " cause))
           (finish))))))
+
+(deftest sleep-ms-does-not-busy-spin-the-node-thread
+  ;; admit-existing-segment! retries every 5 ms for up to 10 s; a Date.now
+  ;; spin would burn a full core for that whole window.
+  (let [before (js/process.cpuUsage)
+        start (js/Date.now)]
+    (fs/sleep-ms! 300)
+    (let [elapsed (- (js/Date.now) start)
+          used (js/process.cpuUsage before)
+          cpu-ms (/ (+ (.-user used) (.-system used)) 1000)]
+      (is (>= elapsed 290) "sleep-ms! still waits the requested time")
+      (is (< cpu-ms 100) (str "sleep-ms! used " cpu-ms " ms of CPU")))))
