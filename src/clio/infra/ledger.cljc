@@ -348,7 +348,14 @@
 
                    (throw cause))))]
     (try
-      (f lock)
+      (let [result (f lock)]
+        ;; The one-link check ran at acquisition; a same-user process may have
+        ;; linked the entry since. Never acknowledge a multiply linked segment.
+        (when (not= 1 (fs/locked-link-count lock))
+          (fail! :clio.ledger/segment-hardlink
+                 "Segment gained a hard link while locked"
+                 {:path path}))
+        result)
       (finally (fs/release-lock! lock)))))
 
 (defn- reclaim-unpublished-temps!
