@@ -842,3 +842,40 @@
         (is (not (fs/exists? path)))
         (is (= :appended (ledger/create-segment! revisions segments event)))
         (is (= [] (creating-entries segments)))))))
+
+(deftest jvm-reclaim-skips-uppercase-or-non-v4-uuid-creating-suffixes
+  ;; publish-temp-path only emits lowercase version-4 UUIDs (random-uuid), so
+  ;; any other UUID spelling is not a Clio temp and must survive reclaim.
+  (with-ledger
+    (fn [{:keys [directory path runtime]}]
+      (let [segments (str directory "/segments")
+            {evt :event} (runtime/append! runtime path :record/observed fixture/facts)
+            revisions (:schema/revisions (runtime/refresh runtime))
+            stem (#'ledger/encode-segment-stem (:event/id evt))
+            upper (str segments "/." stem ".creating-AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE")
+            v1 (str segments "/." stem ".creating-aaaaaaaa-bbbb-1ccc-8ddd-eeeeeeeeeeee")]
+        (fs/ensure-dir! segments)
+        (is (= :appended (ledger/create-segment! revisions segments evt)))
+        (spit upper "{:note :operator-upper}\n")
+        (spit v1 "{:note :operator-v1}\n")
+        (is (= :already-present (ledger/create-segment! revisions segments evt)))
+        (is (.exists (java.io.File. upper)) "uppercase UUID suffix must survive reclaim")
+        (is (.exists (java.io.File. v1)) "non-v4 UUID suffix must survive reclaim")))))
+
+(deftest jvm-try-entry-lock-on-owned-path-releases-its-guard-hold
+  ;; A nil try-acquire on a path this thread already locks must not leave an
+  ;; extra process-guard hold behind once the original token is released.
+  (with-ledger
+    (fn [{:keys [path]}]
+      (let [guard @#'fs/process-guard
+            token (fs/acquire-entry-lock! path)]
+        (is (nil? (fs/try-acquire-entry-lock! path)))
+        (fs/release-lock! token)
+        (is (not (.isLocked ^java.util.concurrent.locks.ReentrantLock guard))
+            "process guard must be fully released")))))
+
+(deftest jvm-fd-position-tag-stays-below-small-filesystem-limits
+  ;; vfat's s_maxbytes is 0xffffffff; ext4 with 1 KiB blocks is about 2^34.
+  (let [lo (some-> (resolve 'clio.extern.jvm.fs/fd-tag-min) deref)
+        hi (some-> (resolve 'clio.extern.jvm.fs/fd-tag-max) deref)]
+    (is (and lo hi (< 0 lo hi 0xffffffff)) "position tag range must stay below 2^32 - 1")))
