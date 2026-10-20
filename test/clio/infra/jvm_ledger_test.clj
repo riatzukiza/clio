@@ -1176,3 +1176,28 @@
         (with-redefs [fs/file-store-read-only? (fn [_] false)]
           (is (false? (boolean (#'fs/read-only-target-error? localized entry)))
               "a writable store with an unrelated error still rethrows"))))))
+
+(deftest jvm-identity-checked-unlink-survives-a-swap-after-the-check
+  ;; A replacement installed after the identity check but before the unlink
+  ;; must survive: the unlink acts on a private quarantine name whose inode was
+  ;; verified, never on the shared pathname.
+  (with-ledger
+    (fn [{:keys [directory]}]
+      (let [entry (str directory "/.temp.creating-x")
+            moved (str directory "/moved-away")
+            owns? fs/locked-entry-owns-path?]
+        (ledger/create-ledger! entry)
+        (let [lock (fs/acquire-entry-lock! entry)]
+          (try
+            (with-redefs [fs/locked-entry-owns-path?
+                          (fn [l p]
+                            (let [r (owns? l p)]
+                              (when (and r (= p entry) (not (fs/exists? moved)))
+                                (java.nio.file.Files/move (nio entry) (nio moved) (make-array java.nio.file.CopyOption 0))
+                                (spit entry "{:replacement true}\n"))
+                              r))]
+              (is (false? (fs/delete-locked-entry-if-owns! lock entry))))
+            (finally (fs/release-lock! lock))))
+        (is (= "{:replacement true}\n" (slurp entry)) "replacement must survive")
+        (is (= [] (filterv #(str/includes? % ".reclaim-") (fs/list-directory directory)))
+            "no quarantine name is left behind")))))
