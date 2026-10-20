@@ -1098,3 +1098,36 @@
               elapsed (- (System/currentTimeMillis) started)]
           (is (= :clio.ledger/segment-hardlink code))
           (is (< elapsed 2000) (str "lasting hard link took " elapsed " ms")))))))
+
+(deftest jvm-entry-lock-reports-an-unlinked-inode-distinctly
+  ;; nlink 0 after open means a concurrent reclaim unlinked the entry, not an
+  ;; extra hard link: report :clio.fs/unlinked-entry.
+  (with-ledger
+    (fn [{:keys [directory]}]
+      (let [entry (str directory "/entry.edn")]
+        (ledger/create-ledger! entry)
+        (with-redefs [fs/fd-link-count (fn [_ _] 0)]
+          (is (= :clio.fs/unlinked-entry
+                 (error-code #(fs/acquire-entry-lock! entry)))))))))
+
+(deftest jvm-temp-unlinked-by-a-winner-is-a-lost-claim
+  ;; The winner published and reclaimed the loser's temp between the loser's
+  ;; open and lock check: the loser must admit through the final segment.
+  (with-ledger
+    (fn [{:keys [directory path runtime]}]
+      (let [segments (str directory "/segments")
+            {evt :event} (runtime/append! runtime path :record/observed fixture/facts)
+            revisions (:schema/revisions (runtime/refresh runtime))
+            acquire! fs/acquire-entry-lock!
+            raced (atom false)]
+        (fs/ensure-dir! segments)
+        (with-redefs [fs/acquire-entry-lock!
+                      (fn [p & more]
+                        (if (and (str/includes? p ".creating-")
+                                 (compare-and-set! raced false true))
+                          (do (is (= :appended (ledger/create-segment! revisions segments evt)))
+                              (throw (ex-info "Directory entry was unlinked"
+                                              {:path p :nlink 0
+                                               :clio/error :clio.fs/unlinked-entry})))
+                          (apply acquire! p more)))]
+          (is (= :already-present (ledger/create-segment! revisions segments evt))))))))
