@@ -453,7 +453,11 @@
   "True when the temp disappeared because a concurrent winner published the
    final segment and reclaimed our unlocked creating temp."
   [cause path]
-  (and (fs/missing-path-error? cause) (fs/exists? path)))
+  (and (or (fs/missing-path-error? cause)
+           ;; The temp was opened, then unlinked by the winner's reclaim
+           ;; before our lock check (nlink 0).
+           (= :clio.fs/unlinked-entry (:clio/error (ex-data cause))))
+       (fs/exists? path)))
 
 (defn- publish-new-segment!
   "Write the event into a hidden temp, then claim the final name with an

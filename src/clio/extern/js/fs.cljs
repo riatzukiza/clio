@@ -303,6 +303,12 @@
     (when-not (.isFile st)
       (throw (ex-info "Directory entry is not a regular file"
                       {:path path :clio/error :clio.fs/not-regular-file})))
+    ;; nlink 0: a concurrent reclaim unlinked the entry after open.
+    (when (zero? nlink)
+      (throw (ex-info "Directory entry was unlinked after open"
+                      {:path path
+                       :nlink nlink
+                       :clio/error :clio.fs/unlinked-entry})))
     (when (not= 1 nlink)
       (throw (ex-info "Directory entry has additional hard links"
                       {:path path

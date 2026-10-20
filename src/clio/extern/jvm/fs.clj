@@ -497,6 +497,12 @@
               (throw (ex-info "Directory entry changed during stale-alias repair"
                               {:path path :clio/error :clio.fs/entry-replaced})))
             (let [nlink (fd-link-count fd path)]
+              ;; nlink 0: a concurrent reclaim unlinked the entry after open.
+              (when (zero? nlink)
+                (throw (ex-info "Directory entry was unlinked after open"
+                                {:path path
+                                 :nlink nlink
+                                 :clio/error :clio.fs/unlinked-entry})))
               (when-not (= 1 nlink)
                 (throw (ex-info "Directory entry has additional hard links"
                                 {:path path
