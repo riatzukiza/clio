@@ -318,15 +318,6 @@
        (some-> (.getReason ^java.nio.file.FileSystemException cause)
                (str/includes? "symbolic links"))))
 
-(defn- link-count
-  [path target-path links]
-  (try (long (Files/getAttribute (nio-path target-path) "unix:nlink" links))
-       (catch Exception cause
-         (throw (ex-info "Filesystem does not expose link count"
-                         {:path path
-                          :clio/error :clio.fs/unsupported-file-identity}
-                         cause)))))
-
 (defn- same-inode-entry?
   "Read `candidate` without following links: true when it is a regular file
    with the file identity `key`. A candidate that vanished is not an alias."
