@@ -398,11 +398,19 @@
       (let [{:keys [channel error]} @state]
         (if error (throw error) channel)))))
 
-(defn- read-only-target-error? [^Throwable cause]
+(defn- file-store-read-only?
+  "True when the file store holding `target-path` is mounted read-only. A
+   stable, locale-independent signal for EROFS (provider reason text varies)."
+  [target-path]
+  (try (.isReadOnly (Files/getFileStore (nio-path target-path)))
+       (catch Exception _ false)))
+
+(defn- read-only-target-error? [^Throwable cause target-path]
   (or (instance? java.nio.file.AccessDeniedException cause)
       (and (instance? java.nio.file.FileSystemException cause)
-           (some-> (.getReason ^java.nio.file.FileSystemException cause)
-                   (str/includes? "Read-only file system")))))
+           (or (some-> (.getReason ^java.nio.file.FileSystemException cause)
+                       (str/includes? "Read-only file system"))
+               (file-store-read-only? target-path)))))
 
 (defn- open-entry-read!
   "Open a checked entry for a shared lock without blocking on a FIFO swap.
@@ -418,7 +426,7 @@
                       (into-array OpenOption [StandardOpenOption/READ StandardOpenOption/WRITE
                                               LinkOption/NOFOLLOW_LINKS]))
     (catch Exception cause
-      (if (read-only-target-error? cause)
+      (if (read-only-target-error? cause target-path)
         (open-entry-bounded! target-path
                              (into-array OpenOption [StandardOpenOption/READ LinkOption/NOFOLLOW_LINKS])
                              path)
