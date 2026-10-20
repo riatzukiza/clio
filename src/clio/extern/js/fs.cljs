@@ -481,10 +481,35 @@
 (defn delete-locked-entry-if-owns!
   "Unlink `path` only when it still names the locked inode. Returns true when
    the entry was removed (or already absent after a same-inode check)."
-  [lock path]
-  (if (locked-entry-owns-path? lock path)
-    (do (unlink-if-present! path) true)
-    false))
+  [{:lock/keys [fd] :as lock} path]
+  (if-not (locked-entry-owns-path? lock path)
+    false
+    ;; Check and unlink cannot be one syscall on a shared name, so first move
+    ;; whatever inode `path` names now to a private quarantine name nobody else
+    ;; knows, then verify and unlink only that name. A replacement swapped in
+    ;; after the check is moved back with a no-clobber hard link.
+    (let [quarantine (str path ".reclaim-" (random-uuid))
+          moved? (try (fs/renameSync path quarantine) true
+                      (catch :default cause
+                        (if (missing-path-error? cause) false (throw cause))))]
+      (cond
+        (not moved?) false
+        (let [st (fs/lstatSync quarantine #js {:bigint true})]
+          (and (.isFile st)
+               (= (stat-identity (fs/fstatSync fd #js {:bigint true}))
+                  (stat-identity st))))
+        (do (unlink-if-present! quarantine) true)
+        :else
+        (do (try (fs/linkSync quarantine path)
+                 (catch :default cause
+                   (if (= "EEXIST" (.-code cause))
+                     (throw (ex-info "Reclaim moved an unrelated entry and cannot restore it"
+                                     {:path path :quarantine quarantine
+                                      :clio/error :clio.fs/reclaim-restore-conflict}
+                                     cause))
+                     (throw cause))))
+            (unlink-if-present! quarantine)
+            false)))))
 
 (defn locked-link-count
   "Link count of the inode owned by the lock's descriptor (fstat, not a path)."

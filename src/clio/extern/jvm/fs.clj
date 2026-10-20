@@ -650,9 +650,31 @@
   "Unlink `path` only when it still names the locked inode. Returns true when
    the entry was removed (or already absent after a same-inode check)."
   [token path]
-  (if (locked-entry-owns-path? token path)
-    (do (Files/deleteIfExists (nio-path path)) true)
-    false))
+  (if-not (locked-entry-owns-path? token path)
+    false
+    ;; Check and unlink cannot be one syscall on a shared name, so first move
+    ;; whatever inode `path` names now to a private quarantine name nobody else
+    ;; knows, then verify and unlink only that name. A replacement swapped in
+    ;; after the check is moved back with a no-clobber hard link.
+    (let [{:keys [file/key]} (lock-entry token)
+          quarantine (str path ".reclaim-" (UUID/randomUUID))
+          moved? (try (Files/move (nio-path path) (nio-path quarantine)
+                                  (into-array CopyOption [StandardCopyOption/ATOMIC_MOVE]))
+                      true
+                      (catch java.nio.file.NoSuchFileException _ false))]
+      (cond
+        (not moved?) false
+        (same-inode-entry? quarantine key)
+        (do (Files/deleteIfExists (nio-path quarantine)) true)
+        :else
+        (do (try (Files/createLink (nio-path path) (nio-path quarantine))
+                 (catch java.nio.file.FileAlreadyExistsException cause
+                   (throw (ex-info "Reclaim moved an unrelated entry and cannot restore it"
+                                   {:path path :quarantine quarantine
+                                    :clio/error :clio.fs/reclaim-restore-conflict}
+                                   cause))))
+            (Files/deleteIfExists (nio-path quarantine))
+            false)))))
 
 (defn locked-link-count
   "Link count of the inode owned by the lock's channel (/proc/self/fd, not a path)."
