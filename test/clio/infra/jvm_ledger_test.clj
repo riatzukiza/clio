@@ -1131,3 +1131,34 @@
                                                :clio/error :clio.fs/unlinked-entry})))
                           (apply acquire! p more)))]
           (is (= :already-present (ledger/create-segment! revisions segments evt))))))))
+
+(deftest jvm-try-entry-lock-binds-the-opened-descriptor
+  ;; An entry swapped between the path stat and the open must not yield a token
+  ;; whose recorded identity differs from the locked descriptor's inode.
+  (with-ledger
+    (fn [{:keys [directory]}]
+      (let [entry (str directory "/entry.edn")
+            file-key @#'fs/file-key]
+        (ledger/create-ledger! entry)
+        (with-redefs [fs/file-key (fn
+                                    ([p] (file-key p))
+                                    ([p links] (if (str/starts-with? (str p) "/proc/")
+                                                 (file-key p links)
+                                                 [:swapped-inode p])))]
+          (let [token (fs/try-acquire-entry-lock! entry)]
+            (when token (fs/release-lock! token))
+            (is (nil? token) "a descriptor/path identity mismatch must not lock")))))))
+
+(deftest jvm-ensure-segment-file-reflushes-an-existing-entry
+  ;; A retry after a failed force/sync must not acknowledge without reflushing.
+  (with-ledger
+    (fn [{:keys [directory runtime]}]
+      (let [store (str directory "/store")
+            evt (event/make-event (:schema/current runtime) :record/observed fixture/facts)
+            synced (atom 0)
+            sync-locked! fs/sync-locked!]
+        (fs/ensure-dir! store)
+        (ledger/create-ledger! (ledger/segment-path store (:event/id evt)))
+        (with-redefs [fs/sync-locked! (fn [lock] (swap! synced inc) (sync-locked! lock))]
+          (ledger/ensure-segment-file! store (:event/id evt)))
+        (is (pos? @synced) "existing segment must be reflushed under its lock")))))
