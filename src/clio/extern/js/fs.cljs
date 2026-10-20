@@ -462,6 +462,24 @@
   (sync-directory! (parent-path target-path))
   path)
 
+(defn locked-entry-owns-path?
+  "True when `path` (no-follow) still names the inode owned by `lock`."
+  [{:lock/keys [fd]} path]
+  (try
+    (let [locked-id (stat-identity (fs/fstatSync fd #js {:bigint true}))
+          st (fs/lstatSync path #js {:bigint true})]
+      (and (.isFile st) (= locked-id (stat-identity st))))
+    (catch :default cause
+      (if (missing-path-error? cause) false (throw cause)))))
+
+(defn delete-locked-entry-if-owns!
+  "Unlink `path` only when it still names the locked inode. Returns true when
+   the entry was removed (or already absent after a same-inode check)."
+  [lock path]
+  (if (locked-entry-owns-path? lock path)
+    (do (unlink-if-present! path) true)
+    false))
+
 (defn locked-link-count
   "Link count of the inode owned by the lock's descriptor (fstat, not a path)."
   [{:lock/keys [fd]}]

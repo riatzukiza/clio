@@ -629,6 +629,20 @@
     (sync-directory! (parent-path target-path))
     path))
 
+(defn locked-entry-owns-path?
+  "True when `path` (no-follow) still names the inode owned by `token`."
+  [token path]
+  (let [{:keys [file/key]} (lock-entry token)]
+    (same-inode-entry? path key)))
+
+(defn delete-locked-entry-if-owns!
+  "Unlink `path` only when it still names the locked inode. Returns true when
+   the entry was removed (or already absent after a same-inode check)."
+  [token path]
+  (if (locked-entry-owns-path? token path)
+    (do (Files/deleteIfExists (nio-path path)) true)
+    false))
+
 (defn locked-link-count
   "Link count of the inode owned by the lock's channel (/proc/self/fd, not a path)."
   [token]

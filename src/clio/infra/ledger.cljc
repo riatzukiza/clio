@@ -331,7 +331,9 @@
    (`repair?`) first drops a stale publish temp of its own inode under the lock,
    so an interrupted publish never leaves it permanently multiply linked; any
    other extra link is still refused as :clio.ledger/segment-hardlink."
-  [acquire! path repair? f]
+  ([acquire! path repair? f]
+   (with-segment-lock acquire! path repair? (constantly path) f))
+  ([acquire! path repair? owned-path f]
   (let [lock (try
                (acquire! path (when repair? {:stale-aliases (stale-publish-aliases path)}))
                (catch #?(:clj Exception :cljs :default) cause
@@ -355,8 +357,19 @@
           (fail! :clio.ledger/segment-hardlink
                  "Segment gained a hard link while locked"
                  {:path path}))
+        ;; Link count alone is not enough: the locked inode may have been
+        ;; renamed away and a replacement installed at `path`. Refuse rather
+        ;; than acknowledge a snapshot no longer named by the segment path.
+        ;; `owned-path` maps the result to the pathname that must still name
+        ;; the locked inode (nil when f deliberately released every name, e.g.
+        ;; a publish whose claim was lost).
+        (when-let [owner (owned-path result)]
+          (when-not (fs/locked-entry-owns-path? lock owner)
+            (fail! :clio.ledger/segment-relocated
+                   "Locked segment no longer occupies its pathname"
+                   {:path owner})))
         result)
-      (finally (fs/release-lock! lock)))))
+      (finally (fs/release-lock! lock))))))
 
 (defn- reclaim-unpublished-temps!
   "After the final segment exists, drop leftover `.<stem>.creating-*` names for
@@ -375,8 +388,10 @@
           (let [tmp (str directory "/" name)]
             (when-let [lock (fs/try-acquire-entry-lock! tmp)]
               (try
-                (fs/delete-if-exists! tmp)
-                (reset! removed true)
+                ;; The entry lock pins an inode, not the name: only unlink when
+                ;; the pathname still identifies that locked inode.
+                (when (fs/delete-locked-entry-if-owns! lock tmp)
+                  (reset! removed true))
                 (finally (fs/release-lock! lock))))))
         (when @removed
           (fs/sync-directory! directory))))))
@@ -408,6 +423,9 @@
           (if (fs/already-exists-error? cause)
             nil
             (throw cause)))))
+    ;; Existing-file fast path must still refuse a rename+replace of the bound
+    ;; directory; creation is the only other place that called ensure.
+    (ensure-bound-directory! directory identity)
     path))
 
 (defn- admit-locked-segment!
@@ -455,6 +473,10 @@
             (try
               (with-segment-lock
                 fs/acquire-entry-lock! tmp false
+                ;; The temp name is intentionally dropped after the hard link:
+                ;; a successful publish must leave the locked inode at the
+                ;; final path; a lost claim leaves it at no name.
+                (fn [result] (when (= :appended result) path))
                 (fn [lock]
                   (append-record! lock "" event)
                   (let [published
@@ -481,8 +503,10 @@
                     ;; Sweep any same-inode creating aliases first — a concurrent
                     ;; loser's observation window can otherwise race the check.
                     (when (and (= :appended published) (not= 1 (fs/locked-link-count lock)))
+                      ;; Only same-inode creating aliases of the locked segment —
+                      ;; never an unrelated concurrent creator's distinct temp.
                       (doseq [alias ((stale-publish-aliases path))]
-                        (fs/delete-if-exists! alias))
+                        (fs/delete-locked-entry-if-owns! lock alias))
                       (fs/sync-directory! directory)
                       (when (not= 1 (fs/locked-link-count lock))
                         (fail! :clio.ledger/segment-hardlink
@@ -501,13 +525,18 @@
           ::claim-lost
           (throw cause))))))
 
+(def ^:private admit-hardlink-retry-ms
+  "Short bound for a transient :segment-hardlink seen at admission. Acquisition
+   already waits for a live publisher's inode lock and repairs same-inode stale
+   aliases, so a lasting extra link fails closed within this bound."
+  250)
+
 (defn- admit-existing-segment!
-  "Admit against a final segment that already exists. A concurrent winner may
-   still be inside the hard-link→unlink window (nlink 2); if acquire sees that
-   as :segment-hardlink, wait briefly and retry until the winner finishes or
-   the deadline elapses. A lasting extra link still fails closed."
+  "Admit against a final segment that already exists. A :segment-hardlink is
+   retried only within admit-hardlink-retry-ms (a lasting external link fails
+   closed promptly); callers must not wrap this in a second admission."
   [path event]
-  (let [deadline (+ (fs/now-ms) 10000)]
+  (let [deadline (+ (fs/now-ms) admit-hardlink-retry-ms)]
     (loop []
       (let [outcome
             (try
@@ -541,24 +570,26 @@
     (ensure-bound-directory! directory identity)
     (refuse-segment-symlink! path)
     (let [outcome
-          (try
-            (if (fs/exists? path)
-              (admit-existing-segment! path event)
-              (do (ensure-bound-directory! directory identity)
-                  (let [published (publish-new-segment! directory path event identity)]
-                    (if (= ::claim-lost published)
-                      (admit-existing-segment! path event)
-                      published))))
-            (catch #?(:clj Exception :cljs :default) cause
-              ;; A concurrent winner may still hold a second link in the
-              ;; publish window, or our own post-publish check may observe it.
-              ;; When the final name exists, admit against it instead of
-              ;; surfacing a transient :segment-hardlink to the caller.
-              (if (and (= :clio.ledger/segment-hardlink
-                          (:clio/error (ex-data cause)))
-                       (fs/exists? path))
-                (admit-existing-segment! path event)
-                (throw cause))))]
+          (if (fs/exists? path)
+            ;; Do not wrap admit in a hardlink→re-admit catch: a lasting extra
+            ;; link already failed closed inside admit; retrying only doubles wait.
+            (admit-existing-segment! path event)
+            (do (ensure-bound-directory! directory identity)
+                (let [published
+                      (try
+                        (publish-new-segment! directory path event identity)
+                        (catch #?(:clj Exception :cljs :default) cause
+                          ;; A concurrent winner may still hold a second link in
+                          ;; the publish window. When the final name exists, admit
+                          ;; against it instead of surfacing a transient hardlink.
+                          (if (and (= :clio.ledger/segment-hardlink
+                                      (:clio/error (ex-data cause)))
+                                   (fs/exists? path))
+                            ::claim-lost
+                            (throw cause))))]
+                  (if (= ::claim-lost published)
+                    (admit-existing-segment! path event)
+                    published))))]
       ;; publish-new-segment! already sweeps after a fresh claim; retries that
       ;; find the final name still clear any leftover creating temps.
       (ensure-bound-directory! directory identity)
@@ -603,16 +634,27 @@
   "Capture validated snapshots of the extra ledger files (for example a frozen
    legacy ledger) and of every segment in `directory`. Each segment snapshot is
    validated for the one-event-per-`<event-id>.edn` format and is the exact
-   value returned; callers canonicalize these snapshots without rereading."
+   value returned; callers canonicalize these snapshots without rereading.
+   The directory identity bound at entry is rechecked before every segment open
+   and at the final fence so a rename+replace cannot feed snapshots from a
+   replacement store."
   [directory extra-paths]
-  (let [paths (segment-paths directory)
+  (let [[directory identity] (bind-segment-directory! directory)
+        _ (ensure-bound-directory! directory identity)
+        paths (segment-paths directory)
+        _ (ensure-bound-directory! directory identity)
         extra (read-ledgers extra-paths)
-        snapshots (into extra (map read-segment!) paths)]
+        snapshots (into extra
+                        (map (fn [path]
+                               (ensure-bound-directory! directory identity)
+                               (read-segment! path)))
+                        paths)]
     ;; Stale-alias repair may have unlinked a publish temp whose directory
-    ;; force failed; a retry no longer sees that alias, so fence the (real)
+    ;; force failed; a retry no longer sees that alias, so fence the bound
     ;; segment directory once before returning any snapshot.
-    (when-let [first-path (first paths)]
-      (fs/sync-directory! (subs first-path 0 (str/last-index-of first-path "/"))))
+    (ensure-bound-directory! directory identity)
+    (when (seq paths)
+      (fs/sync-directory! directory))
     snapshots))
 
 (defn canonicalize-directory
