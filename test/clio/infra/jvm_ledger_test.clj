@@ -959,3 +959,142 @@
           (try (ledger/ensure-segment-file! link (:event/id event)) (catch Exception _ nil)))
         (is (not (.exists (java.io.File. (str b "/" name))))
             "segment must not be created in the retargeted store")))))
+
+(defn- nio [s] (java.nio.file.Paths/get s (make-array String 0)))
+
+(defn- segment-stem [segments id]
+  (let [name (last (str/split (ledger/segment-path segments id) #"/"))]
+    (subs name 0 (- (count name) (count ".edn")))))
+
+(deftest jvm-segment-lock-refuses-a-relocated-locked-inode
+  ;; Rename the locked inode to another one-link name and install a replacement
+  ;; at the segment path while f runs: link count stays 1, but the path no
+  ;; longer names the locked inode, so the operation must not be acknowledged.
+  (with-ledger
+    (fn [{:keys [directory]}]
+      (let [segment (str directory "/seg.edn")
+            moved (str directory "/moved.edn")]
+        (ledger/create-ledger! segment)
+        (is (= :clio.ledger/segment-relocated
+               (error-code
+                #(#'ledger/with-segment-lock
+                  fs/acquire-entry-lock! segment false
+                  (fn [_]
+                    (java.nio.file.Files/move (nio segment) (nio moved) (make-array java.nio.file.CopyOption 0))
+                    (spit segment "")
+                    :ok)))))))))
+
+(deftest jvm-reclaim-never-unlinks-a-replacement-at-the-temp-path
+  ;; The entry lock pins an inode: if the locked temp is renamed away and an
+  ;; unrelated file installed at its name, reclaim must leave the replacement.
+  (with-ledger
+    (fn [{:keys [directory runtime]}]
+      (let [segments (str directory "/segments")
+            evt (event/make-event (:schema/current runtime) :record/observed fixture/facts)
+            id (:event/id evt)
+            final (ledger/segment-path segments id)
+            tmp (str segments "/." (segment-stem segments id) ".creating-" (host/random-uuid))
+            moved (str directory "/moved-temp")
+            try-lock! fs/try-acquire-entry-lock!]
+        (fs/ensure-dir! segments)
+        (ledger/create-ledger! final)
+        (ledger/create-ledger! tmp)
+        (with-redefs [fs/try-acquire-entry-lock!
+                      (fn [p]
+                        (let [lock (try-lock! p)]
+                          (when (and lock (= p tmp))
+                            (java.nio.file.Files/move (nio tmp) (nio moved) (make-array java.nio.file.CopyOption 0))
+                            (spit tmp "{:unrelated true}\n"))
+                          lock))]
+          (#'ledger/reclaim-unpublished-temps! segments id))
+        (is (= "{:unrelated true}\n" (slurp tmp))
+            "replacement at the temp pathname must survive reclaim")))))
+
+(deftest jvm-publish-sweep-keeps-a-distinct-concurrent-temp
+  ;; After an external hard link lands on the published inode, the post-publish
+  ;; sweep may only drop same-inode creating aliases, never another publisher's
+  ;; distinct-inode temp for the same event id.
+  (with-ledger
+    (fn [{:keys [directory path runtime]}]
+      (let [segments (str directory "/segments")
+            {evt :event} (runtime/append! runtime path :record/observed fixture/facts)
+            revisions (:schema/revisions (runtime/refresh runtime))
+            id (:event/id evt)
+            other-temp (str segments "/." (segment-stem segments id) ".creating-" (host/random-uuid))
+            external (str directory "/external-link.edn")
+            link! fs/hard-link!]
+        (fs/ensure-dir! segments)
+        (with-redefs [fs/hard-link! (fn [from to]
+                                      (link! from to)
+                                      (link! from external)
+                                      (spit other-temp "{:other :publisher}\n"))]
+          (is (= :clio.ledger/segment-hardlink
+                 (error-code #(ledger/create-segment! revisions segments evt)))))
+        (is (fs/exists? other-temp)
+            "a distinct-inode concurrent temp must not be swept")))))
+
+(deftest jvm-ensure-segment-file-rechecks-directory-on-existing-file-path
+  ;; If the bound directory is replaced by one that already holds the segment,
+  ;; the existing-file fast path must still fail closed.
+  (with-ledger
+    (fn [{:keys [directory runtime]}]
+      (let [store (str directory "/store")
+            moved (str directory "/store-moved")
+            impostor (str directory "/impostor")
+            evt (event/make-event (:schema/current runtime) :record/observed fixture/facts)
+            id (:event/id evt)
+            swapped (atom false)
+            symlink? fs/symlink?]
+        (fs/ensure-dir! store)
+        (fs/ensure-dir! impostor)
+        (ledger/create-ledger! (ledger/segment-path impostor id))
+        (with-redefs [fs/symlink? (fn [p]
+                                    (when (compare-and-set! swapped false true)
+                                      (.renameTo (java.io.File. store) (java.io.File. moved))
+                                      (.renameTo (java.io.File. impostor) (java.io.File. store)))
+                                    (symlink? p))]
+          (is (= :clio.ledger/directory-replaced
+                 (error-code #(ledger/ensure-segment-file! store id)))))))))
+
+(deftest jvm-read-directory-retains-the-directory-binding
+  ;; A rename+replace after enumeration must not feed same-named valid
+  ;; segments from the replacement store into canonicalization.
+  (with-ledger
+    (fn [{:keys [directory path runtime]}]
+      (let [store (str directory "/store")
+            moved (str directory "/store-moved")
+            impostor (str directory "/impostor")
+            {evt :event} (runtime/append! runtime path :record/observed fixture/facts)
+            revisions (:schema/revisions (runtime/refresh runtime))
+            swapped (atom false)
+            symlink? fs/symlink?]
+        (fs/ensure-dir! store)
+        (fs/ensure-dir! impostor)
+        (is (= :appended (ledger/create-segment! revisions store evt)))
+        (let [name (last (str/split (ledger/segment-path store (:event/id evt)) #"/"))]
+          (java.nio.file.Files/copy (nio (str store "/" name)) (nio (str impostor "/" name))
+                                    (make-array java.nio.file.CopyOption 0)))
+        (with-redefs [fs/symlink? (fn [p]
+                                    (when (compare-and-set! swapped false true)
+                                      (.renameTo (java.io.File. store) (java.io.File. moved))
+                                      (.renameTo (java.io.File. impostor) (java.io.File. store)))
+                                    (symlink? p))]
+          (is (= :clio.ledger/directory-replaced
+                 (error-code #(ledger/read-directory store [])))))))))
+
+(deftest jvm-lasting-segment-hardlink-fails-closed-promptly
+  ;; A lasting external link must not block create-segment! for two nested
+  ;; 10-second admission retries.
+  (with-ledger
+    (fn [{:keys [directory path runtime]}]
+      (let [segments (str directory "/segments")
+            {evt :event} (runtime/append! runtime path :record/observed fixture/facts)
+            revisions (:schema/revisions (runtime/refresh runtime))]
+        (fs/ensure-dir! segments)
+        (is (= :appended (ledger/create-segment! revisions segments evt)))
+        (fs/hard-link! (ledger/segment-path segments (:event/id evt)) (str directory "/outside.edn"))
+        (let [started (System/currentTimeMillis)
+              code (error-code #(ledger/create-segment! revisions segments evt))
+              elapsed (- (System/currentTimeMillis) started)]
+          (is (= :clio.ledger/segment-hardlink code))
+          (is (< elapsed 2000) (str "lasting hard link took " elapsed " ms")))))))
