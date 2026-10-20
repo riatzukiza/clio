@@ -569,10 +569,16 @@
                                                     LinkOption/NOFOLLOW_LINKS])
                     channel (FileChannel/open (nio-path target-path) options)]
                 (try
-                  (let [lock (.tryLock channel 0 Long/MAX_VALUE false)]
+                  (let [lock (.tryLock channel 0 Long/MAX_VALUE false)
+                        ;; Bind to the opened descriptor's inode (/proc/self/fd),
+                        ;; like acquire-lock-mode!: an entry swapped between the
+                        ;; path stat and the open must not yield a token whose
+                        ;; recorded key names a different inode.
+                        fd (when lock (channel-fd-int channel))]
                     (if (nil? lock)
                       (do (.close channel) nil)
-                      (if (not= 1 (link-count path target-path links))
+                      (if (or (not= key (fd-file-key fd))
+                              (not= 1 (fd-link-count fd path)))
                         (do (.release lock) (.close channel) nil)
                         (let [token (str (UUID/randomUUID))]
                           (swap! active-locks assoc token

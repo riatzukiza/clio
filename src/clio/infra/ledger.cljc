@@ -423,6 +423,10 @@
           (if (fs/already-exists-error? cause)
             nil
             (throw cause)))))
+    ;; Reflush under the entry lock on every path: a retry after a failed
+    ;; file force or parent sync must not acknowledge the same uncertain
+    ;; durability state, and a concurrent creator's entry is forced too.
+    (with-segment-lock fs/acquire-entry-lock! path true fs/sync-locked!)
     ;; Existing-file fast path must still refuse a rename+replace of the bound
     ;; directory; creation is the only other place that called ensure.
     (ensure-bound-directory! directory identity)
