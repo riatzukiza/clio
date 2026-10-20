@@ -1162,3 +1162,17 @@
         (with-redefs [fs/sync-locked! (fn [lock] (swap! synced inc) (sync-locked! lock))]
           (ledger/ensure-segment-file! store (:event/id evt)))
         (is (pos? @synced) "existing segment must be reflushed under its lock")))))
+
+(deftest jvm-read-only-open-detection-does-not-depend-on-provider-text
+  ;; EROFS may arrive with a provider-defined or localized reason; the bounded
+  ;; READ fallback must key off the file store, not English text.
+  (with-ledger
+    (fn [{:keys [directory]}]
+      (let [entry (str directory "/entry.edn")
+            localized (java.nio.file.FileSystemException. entry nil "Système de fichiers accessible en lecture seulement")]
+        (ledger/create-ledger! entry)
+        (with-redefs [fs/file-store-read-only? (fn [_] true)]
+          (is (true? (boolean (#'fs/read-only-target-error? localized entry)))))
+        (with-redefs [fs/file-store-read-only? (fn [_] false)]
+          (is (false? (boolean (#'fs/read-only-target-error? localized entry)))
+              "a writable store with an unrelated error still rethrows"))))))
