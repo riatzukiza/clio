@@ -59,3 +59,25 @@
                                             #js {:value value :configurable true}))]
     (define! platform)
     (try (operation) (finally (define! original)))))
+
+(defn with-stat-only-descriptor-proxies
+  "Model a host where fd nodes stat as directories but child traversal refuses."
+  [operation]
+  (let [original-stat (.-statSync native)
+        original-close (.-closeSync native)
+        probes (atom 0)
+        closes (atom 0)]
+    (set! (.-statSync native)
+          (fn [& args]
+            (if (re-matches #"/(?:proc/self/fd|dev/fd)/[0-9]+/\." (first args))
+              (do (swap! probes inc)
+                  (throw (js/Error. "Injected descriptor proxy traversal refusal")))
+              (.apply original-stat native (clj->js args)))))
+    (set! (.-closeSync native)
+          (fn [fd] (swap! closes inc) (original-close fd)))
+    (syncBuiltinESMExports)
+    (try {:result (operation) :probes @probes :closes @closes}
+         (finally
+           (set! (.-statSync native) original-stat)
+           (set! (.-closeSync native) original-close)
+           (syncBuiltinESMExports)))))
