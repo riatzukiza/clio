@@ -535,7 +535,7 @@
                                  :nlink nlink
                                  :clio/error :clio.fs/multiply-linked-entry})))))
           (swap! active-locks assoc token
-                 {:channel channel :file-lock lock :file/key key
+                 {:channel channel :file-lock lock :file/key key :fd fd
                   :path (display-entry-path path) :target-path target-path :read-only? (boolean read-only?)})
           {:lock/id token :lock/path (display-entry-path path)})
         (catch Throwable cause
@@ -608,7 +608,7 @@
                         (do (.release lock) (.close channel) nil)
                         (let [token (str (UUID/randomUUID))]
                           (swap! active-locks assoc token
-                                 {:channel channel :file-lock lock :file/key key
+                                 {:channel channel :file-lock lock :file/key key :fd fd
                                   :path path :target-path target-path})
                           (vreset! created? true)
                           {:lock/id token :lock/path path}))))
@@ -706,8 +706,8 @@
 (defn locked-link-count
   "Link count of the inode owned by the lock's channel (/proc/self/fd, not a path)."
   [token]
-  (let [{:keys [^FileChannel channel path]} (lock-entry token)]
-    (fd-link-count (channel-fd-int channel) path)))
+  (let [{:keys [^FileChannel channel path fd]} (lock-entry token)]
+    (fd-link-count (or fd (channel-fd-int channel)) path)))
 
 (defn sync-locked!
   "Reflush the locked inode and parent, including an uncertain earlier creation."
