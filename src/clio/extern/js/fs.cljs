@@ -4,19 +4,76 @@
             ["node:fs" :as fs]
             ["node:path" :as node-path]))
 
+(def ^:private pinned-directories (atom {}))
+
 (defn exists?
   [path]
   (boolean (fs/existsSync path)))
+
+(defn now-ms
+  []
+  (js/Date.now))
+
+(def ^:private sleep-cell
+  (js/Int32Array. (js/SharedArrayBuffer. 4)))
+
+(defn sleep-ms!
+  "Synchronously wait `ms` without spinning: Atomics.wait parks the thread on a
+   private cell that is never notified, so the retry backoff uses no CPU."
+  [ms]
+  (when (pos? ms)
+    (js/Atomics.wait sleep-cell 0 0 ms))
+  nil)
+
+(defn symlink?
+  "True when `path` is a symbolic link (lstat), whether or not the target exists."
+  [path]
+  (try
+    (.isSymbolicLink (fs/lstatSync path))
+    (catch :default _ false)))
 
 (defn absolute-path
   "Resolve the existing target through the filesystem, preserving link/.. semantics."
   [path]
   ;; Node's JavaScript realpath implementation normalizes '..' before walking
   ;; links. The native resolver follows the same filesystem semantics as open.
-  (.native ^js (.-realpathSync fs) path))
+  ;; A library-owned descriptor path must keep its kernel binding. Resolving
+  ;; it back to a pathname would reintroduce parent-directory ABA.
+  (if (contains? @pinned-directories path)
+    path
+    (.native ^js (.-realpathSync fs) path)))
+
+(defn absolute-lexical-path
+  "Make `path` absolute against the process working directory without requiring
+   the target to exist. Unlike absolute-path, this does not consult the
+   filesystem or resolve symlinks; it only eliminates relative spelling."
+  [path]
+  (.resolve node-path path))
+
+(defn directory-identity
+  "Device/inode of an existing directory after resolving the final path."
+  [path]
+  (let [st (fs/statSync path #js {:bigint true})]
+    (when-not (.isDirectory st)
+      (throw (ex-info "Path is not a directory"
+                      {:path path :clio/error :clio.fs/not-directory})))
+    [(str (.-dev st)) (str (.-ino st))]))
+
+(defn same-directory-identity?
+  "True when `path` still names the directory identity captured earlier."
+  [path identity]
+  (try
+    (and (= (directory-identity path) identity)
+         (if-let [logical (get @pinned-directories path)]
+           (= (directory-identity logical) identity)
+           true))
+    (catch :default _ false)))
 
 (defn missing-path-error? [cause]
   (= "ENOENT" (.-code cause)))
+
+(defn already-exists-error? [cause]
+  (= "EEXIST" (.-code cause)))
 
 (defn require-directory-sync-support!
   "Refuse a host without Linux directory durability before any write becomes visible."
@@ -84,6 +141,44 @@
 (defn- stat-identity [^js stat]
   [(str (.-dev stat)) (str (.-ino stat))])
 
+(defn- display-entry-path [path]
+  (if-let [directory (get @pinned-directories (.dirname node-path path))]
+    (.join node-path directory (.basename node-path path))
+    path))
+
+(defn with-pinned-directory!
+  "Call f with a directory path anchored to an owning read-only descriptor.
+   Capability-probe descriptor namespaces rather than falling back to a
+   replaceable pathname. The path is valid only during f; all paths opened
+   below it keep the captured parent, including while it is renamed."
+  [path f]
+  (let [fd (.openSync fs path (bit-or (.-O_RDONLY (.-constants fs))
+                                    (.-O_DIRECTORY (.-constants fs))))]
+    (try
+      (let [st (.fstatSync fs fd #js {:bigint true})
+            _ (when-not (.isDirectory st)
+                (throw (ex-info "Path is not a directory"
+                                {:path path :clio/error :clio.fs/not-directory})))
+            identity (stat-identity st)
+            pinned (some (fn [root]
+                           (let [candidate (str root "/" fd)]
+                             (try
+                               ;; An fd proxy can stat as its backing directory
+                               ;; without supporting child traversal.
+                               (let [bound (.statSync fs (str candidate "/.") #js {:bigint true})]
+                                 (when (and (.isDirectory bound)
+                                            (= identity (stat-identity bound)))
+                                   candidate))
+                               (catch :default _ nil))))
+                         ["/proc/self/fd" "/dev/fd"])]
+        (when-not pinned
+          (throw (ex-info "Host cannot bind segment operations to a directory descriptor"
+                          {:path path :clio/error :clio.fs/directory-binding-unavailable})))
+        (swap! pinned-directories assoc pinned path)
+        (try (f pinned)
+             (finally (swap! pinned-directories dissoc pinned))))
+      (finally (.closeSync fs fd)))))
+
 (defn- refuse-locked-path! [path]
   (when (and (seq @locked-paths)
              (or (contains? @locked-paths path)
@@ -145,6 +240,12 @@
     (vec (fs/readdirSync path))
     []))
 
+(defn list-directory
+  "List entry names in an existing directory. Unlike list-files, a missing or
+   vanished directory throws (see missing-path-error?) instead of reading as empty."
+  [path]
+  (vec (fs/readdirSync path)))
+
 (defn ^:async wait-for-exists!
   [path timeout-ms]
   (let [deadline (+ (js/Date.now) timeout-ms)]
@@ -197,20 +298,117 @@
      0 0 0xffffffff 0xffffffff)
     (acquire-unix-lock! fd read-only?)))
 
+(defn- entry-path
+  "Resolve only the parent directory, keeping the final entry name unresolved so
+   a no-follow open binds to the directory entry itself."
+  [path]
+  (.join node-path (absolute-path (.dirname node-path path)) (.basename node-path path)))
+
+(defn- open-entry!
+  "Open `target-path`. When `nofollow?`, combine O_NOFOLLOW with O_NONBLOCK so a
+   FIFO/socket swapped in after the lstat type check cannot block the reader
+   indefinitely before the descriptor type guard runs."
+  [target-path flags nofollow? path]
+  (try
+    (let [constants (.-constants fs)
+          open-flags (cond-> flags
+                       nofollow? (bit-or (.-O_NOFOLLOW constants)
+                                         (.-O_NONBLOCK constants)))]
+      (.openSync fs target-path open-flags))
+    (catch :default cause
+      (cond
+        (and nofollow? (= "ELOOP" (.-code cause)))
+        (throw (ex-info "Directory entry is a symbolic link"
+                        {:path path :clio/error :clio.fs/symlink-entry} cause))
+
+        (and nofollow? (#{"ENXIO" "EOPNOTSUPP"} (.-code cause)))
+        (throw (ex-info "Directory entry is not a regular file"
+                        {:path path :clio/error :clio.fs/not-regular-file} cause))
+
+        :else (throw cause)))))
+
+(defn- refuse-nofollow-entry-type!
+  "lstat the directory entry before any open. A FIFO/socket open with O_RDONLY
+   blocks until a writer appears; refuse non-regular types first. Hard-link
+   counts are checked only after the inode lock is held so a publisher that
+   briefly links an unpublished temp is not rejected mid-flight."
+  [path target-path]
+  (let [st (fs/lstatSync target-path)]
+    (cond
+      (.isSymbolicLink st)
+      (throw (ex-info "Directory entry is a symbolic link"
+                      {:path path :clio/error :clio.fs/symlink-entry}))
+
+      (not (.isFile st))
+      (throw (ex-info "Directory entry is not a regular file"
+                      {:path path :clio/error :clio.fs/not-regular-file})))))
+
+(defn- refuse-multiply-linked-fd!
+  [path fd]
+  (let [st (fs/fstatSync fd)
+        nlink (.-nlink st)]
+    (when-not (.isFile st)
+      (throw (ex-info "Directory entry is not a regular file"
+                      {:path path :clio/error :clio.fs/not-regular-file})))
+    ;; nlink 0: a concurrent reclaim unlinked the entry after open.
+    (when (zero? nlink)
+      (throw (ex-info "Directory entry was unlinked after open"
+                      {:path path
+                       :nlink nlink
+                       :clio/error :clio.fs/unlinked-entry})))
+    (when (not= 1 nlink)
+      (throw (ex-info "Directory entry has additional hard links"
+                      {:path path
+                       :nlink nlink
+                       :clio/error :clio.fs/multiply-linked-entry})))))
+
+(defn- unlink-if-present!
+  [path]
+  (try (fs/unlinkSync path)
+       (catch :default cause
+         (when-not (missing-path-error? cause) (throw cause)))))
+
+(defn- same-inode-entry?
+  "lstat `candidate` without following links: true when it is a regular file
+   naming the inode `identity`. A candidate that vanished is not an alias."
+  [candidate identity]
+  (try
+    (let [st (fs/lstatSync candidate #js {:bigint true})]
+      (and (.isFile st) (= identity (stat-identity st))))
+    (catch :default cause
+      (if (missing-path-error? cause) false (throw cause)))))
+
+(defn- repair-stale-aliases!
+  "With the inode lock held and more than one link observed, unlink each
+   caller-named candidate entry that is this same inode, then force the parent
+   directory. The caller names only entries whose owner must hold this lock
+   while they exist, so a lock holder that still sees them knows the owner is
+   gone. Anything else keeps its link and the link-count guard still refuses."
+  [target-path fd stale-aliases]
+  (let [identity (stat-identity (fs/fstatSync fd #js {:bigint true}))
+        aliases (filterv #(same-inode-entry? % identity) (stale-aliases))]
+    (doseq [alias aliases] (unlink-if-present! alias))
+    (when (seq aliases) (sync-directory! (parent-path target-path)))))
+
 (defn- acquire-lock-mode!
-  [path read-only?]
+  [path read-only? nofollow? {:keys [stale-aliases]}]
   ;; Bind the resolved target before opening it: a later symlink retarget must
   ;; not move the parent fence away from the inode owned by this descriptor.
-  (let [target-path (absolute-path path)
+  ;; A no-follow open instead binds the named entry and refuses a symlink there.
+  (let [target-path (if nofollow? (entry-path path) (absolute-path path))
+        _ (when nofollow? (refuse-nofollow-entry-type! path target-path))
         _ (refuse-locked-path! target-path)
         flags (if read-only?
                 (.-O_RDONLY (.-constants fs))
                 (bit-or (.-O_APPEND (.-constants fs)) (.-O_RDWR (.-constants fs))))
-        fd (.openSync fs target-path flags)]
+        fd (open-entry! target-path flags nofollow? path)]
     (try
       (acquire-native-lock! fd read-only?)
+      (when (and nofollow? stale-aliases (< 1 (.-nlink (fs/fstatSync fd))))
+        (repair-stale-aliases! target-path fd stale-aliases))
+      (when nofollow? (refuse-multiply-linked-fd! path fd))
       (swap! locked-paths assoc target-path (stat-identity (fs/fstatSync fd #js {:bigint true})))
-      {:lock/path path :lock/target-path target-path :lock/fd fd}
+      {:lock/path (display-entry-path path) :lock/target-path target-path :lock/fd fd}
       (catch :default cause
         (fs/closeSync fd)
         (throw cause)))))
@@ -238,7 +436,7 @@
    here and appended to as an empty history. create-ledger! is the only
    creation path; an absent ledger fails with ENOENT."
   [path]
-  (acquire-lock-mode! path false))
+  (acquire-lock-mode! path false false nil))
 
 (defn acquire-read-lock!
   "Open an existing ledger read-only and hold a shared lock against exclusive writers.
@@ -247,7 +445,61 @@
    Windows uses shared LockFileEx. The same inode guard, owning-descriptor read
    and release operation apply. This never creates storage or upgrades access."
   [path]
-  (acquire-lock-mode! path true))
+  (acquire-lock-mode! path true false nil))
+
+(defn acquire-entry-lock!
+  "Like acquire-lock!, but open the directory entry with O_NOFOLLOW so the
+   checked entry is the opened inode: a symlink swapped in after a check fails
+   with :clio.fs/symlink-entry instead of redirecting outside the directory.
+
+   The entry must have exactly one link once locked. `:stale-aliases`, when
+   given, is a zero-argument function naming candidate entries that may only
+   exist while their owner holds this inode's lock (an interrupted publisher's
+   temp). Under the lock, candidates that are this same inode are unlinked and
+   the directory is forced before the one-link guard runs."
+  ([path] (acquire-entry-lock! path nil))
+  ([path options] (acquire-lock-mode! path false true options)))
+
+(defn- try-fcntl-exclusive!
+  "Non-blocking exclusive whole-file fcntl. Returns true when acquired."
+  [fd]
+  (try
+    (fs-ext/fcntlSync fd "setlk" (native-constant "F_WRLCK") 0 0)
+    true
+    (catch :default cause
+      (if (#{"EAGAIN" "EACCES" "EWOULDBLOCK"} (.-code cause))
+        false
+        (throw cause)))))
+
+(defn try-acquire-entry-lock!
+  "Non-blocking counterpart of acquire-entry-lock!. Returns nil when the entry
+   is missing, locked by another holder, multiply linked, or unavailable."
+  [path]
+  (try
+    (let [target-path (entry-path path)]
+      (refuse-nofollow-entry-type! path target-path)
+      (refuse-locked-path! target-path)
+      (let [flags (bit-or (.-O_APPEND (.-constants fs)) (.-O_RDWR (.-constants fs)))
+            fd (open-entry! target-path flags true path)]
+        (try
+          (if-not (try-fcntl-exclusive! fd)
+            (do (fs/closeSync fd) nil)
+            (let [st (fs/fstatSync fd)]
+              (if (not= 1 (.-nlink st))
+                (do (fs/closeSync fd) nil)
+                (do (swap! locked-paths assoc target-path
+                           (stat-identity (fs/fstatSync fd #js {:bigint true})))
+                    {:lock/path path :lock/target-path target-path :lock/fd fd}))))
+          (catch :default cause
+            (fs/closeSync fd)
+            (throw cause)))))
+    (catch :default _
+      nil)))
+
+(defn acquire-entry-read-lock!
+  "Shared-lock counterpart of acquire-entry-lock!, with the same `:stale-aliases`."
+  ([path] (acquire-entry-read-lock! path nil))
+  ([path options] (acquire-lock-mode! path true true options)))
 
 (defn read-locked-text
   "Read the locked ledger through the same descriptor that owns the lock."
@@ -262,6 +514,54 @@
   (.fsyncSync fs fd)
   (sync-directory! (parent-path target-path))
   path)
+
+(defn locked-entry-owns-path?
+  "True when `path` (no-follow) still names the inode owned by `lock`."
+  [{:lock/keys [fd]} path]
+  (try
+    (let [locked-id (stat-identity (fs/fstatSync fd #js {:bigint true}))
+          st (fs/lstatSync path #js {:bigint true})]
+      (and (.isFile st) (= locked-id (stat-identity st))))
+    (catch :default cause
+      (if (missing-path-error? cause) false (throw cause)))))
+
+(defn delete-locked-entry-if-owns!
+  "Unlink `path` only when it still names the locked inode. Returns true when
+   the entry was removed (or already absent after a same-inode check)."
+  [{:lock/keys [fd] :as lock} path]
+  (if-not (locked-entry-owns-path? lock path)
+    false
+    ;; Check and unlink cannot be one syscall on a shared name, so first move
+    ;; whatever inode `path` names now to a private quarantine name nobody else
+    ;; knows, then verify and unlink only that name. A replacement swapped in
+    ;; after the check is moved back with a no-clobber hard link.
+    (let [quarantine (str path ".reclaim-" (random-uuid))
+          moved? (try (fs/renameSync path quarantine) true
+                      (catch :default cause
+                        (if (missing-path-error? cause) false (throw cause))))]
+      (cond
+        (not moved?) false
+        (let [st (fs/lstatSync quarantine #js {:bigint true})]
+          (and (.isFile st)
+               (= (stat-identity (fs/fstatSync fd #js {:bigint true}))
+                  (stat-identity st))))
+        (do (unlink-if-present! quarantine) true)
+        :else
+        (do (try (fs/linkSync quarantine path)
+                 (catch :default cause
+                   (if (= "EEXIST" (.-code cause))
+                     (throw (ex-info "Reclaim moved an unrelated entry and cannot restore it"
+                                     {:path path :quarantine quarantine
+                                      :clio/error :clio.fs/reclaim-restore-conflict}
+                                     cause))
+                     (throw cause))))
+            (unlink-if-present! quarantine)
+            false)))))
+
+(defn locked-link-count
+  "Link count of the inode owned by the lock's descriptor (fstat, not a path)."
+  [{:lock/keys [fd]}]
+  (.-nlink (fs/fstatSync fd)))
 
 (defn sync-locked!
   "Reflush the locked inode and parent, including an uncertain earlier creation."

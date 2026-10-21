@@ -21,6 +21,19 @@
 (defn- error-code [operation]
   (try (operation) nil (catch :default cause (:clio/error (ex-data cause)))))
 
+(deftest stat-only-directory-descriptor-proxies-refuse-before-the-callback
+  (with-directory
+    (fn [directory]
+      (let [called? (atom false)
+            result (observer/with-stat-only-descriptor-proxies
+                     #(error-code
+                        (fn [] (fs/with-pinned-directory!
+                                 directory (fn [_] (reset! called? true))))))]
+        (is (= :clio.fs/directory-binding-unavailable (:result result)))
+        (is (false? @called?))
+        (is (= 2 (:probes result)) "both descriptor namespaces require traversal")
+        (is (= 1 (:closes result)) "the owning directory descriptor is closed")))))
+
 (defn- with-ledger-alias [relative? operation]
   (with-directory
     (fn [directory]

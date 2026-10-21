@@ -6,6 +6,12 @@
    :schema-root [:tuple :string]
    :append [:tuple :string :string :string :string :string]
    :retry-append [:tuple :string :string]
+   :append-segment [:tuple :string :string :string :string :string]
+   :canonicalize-dir
+   [:and
+    [:vector :string]
+    [:fn {:error/message "requires schema directory and a segment directory"}
+     #(>= (count %) 2)]]
    :canonicalize
    [:and
     [:vector :string]
