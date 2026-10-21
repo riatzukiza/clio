@@ -30,6 +30,28 @@
 (defn reduce-amount [state evt]
   (+ state (get-in evt [:event/data :amount])))
 
+(deftest jvm-entry-link-count-retains-the-open-descriptor
+  (with-ledger
+    (fn [{:keys [directory]}]
+      (let [entry (str directory "/entry.edn")]
+        (ledger/create-ledger! entry)
+        (doseq [acquire! [fs/acquire-entry-lock!
+                         fs/acquire-entry-read-lock!
+                         fs/try-acquire-entry-lock!]]
+          (let [token (acquire! entry)]
+            (try
+              ;; Discovery can become unavailable after acquisition; the
+              ;; retained channel still owns the same descriptor and inode.
+              (with-redefs [fs/channel-fd-int
+                            (fn [_]
+                              (throw (ex-info "Descriptor rediscovery unavailable"
+                                              {:clio/error :unexpected-descriptor-scan})))]
+                (dotimes [_ 2]
+                  (is (= 1 (try (fs/locked-link-count token)
+                                (catch Exception cause
+                                  (:clio/error (ex-data cause))))))))
+              (finally (fs/release-lock! token)))))))))
+
 (deftest jvm-canonical-snapshots-release-the-owning-channel-on-read-failure
   (with-ledger
     (fn [{:keys [path runtime]}]
