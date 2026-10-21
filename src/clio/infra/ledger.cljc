@@ -350,10 +350,11 @@
 
                    (throw cause))))]
     (try
-      (let [result (f lock)]
+      (let [result (f lock)
+            owner (owned-path result)]
         ;; The one-link check ran at acquisition; a same-user process may have
         ;; linked the entry since. Never acknowledge a multiply linked segment.
-        (when (not= 1 (fs/locked-link-count lock))
+        (when (and owner (not= 1 (fs/locked-link-count lock)))
           (fail! :clio.ledger/segment-hardlink
                  "Segment gained a hard link while locked"
                  {:path path}))
@@ -363,7 +364,7 @@
         ;; `owned-path` maps the result to the pathname that must still name
         ;; the locked inode (nil when f deliberately released every name, e.g.
         ;; a publish whose claim was lost).
-        (when-let [owner (owned-path result)]
+        (when owner
           (when-not (fs/locked-entry-owns-path? lock owner)
             (fail! :clio.ledger/segment-relocated
                    "Locked segment no longer occupies its pathname"
@@ -661,7 +662,20 @@
     ;; force failed; a retry no longer sees that alias, so fence the bound
     ;; segment directory once before returning any snapshot.
     (ensure-bound-directory! directory identity)
-    (when (seq paths)
+    (when (and (seq paths)
+               (try
+                 (fs/require-directory-sync-support! directory)
+                 true
+                 (catch #?(:clj Exception :cljs :default) cause
+                   ;; Read-only replay is supported without directory durability.
+                   ;; Only the unsupported preflight is optional; failures of the
+                   ;; actual force below must always propagate, even without a
+                   ;; nested cause.
+                   (if (and (= :clio.fs/directory-sync-unavailable
+                               (:clio/error (ex-data cause)))
+                            (nil? (ex-cause cause)))
+                     false
+                     (throw cause)))))
       (fs/sync-directory! directory))
     snapshots))
 
