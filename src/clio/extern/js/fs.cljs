@@ -163,7 +163,9 @@
             pinned (some (fn [root]
                            (let [candidate (str root "/" fd)]
                              (try
-                               (let [bound (.statSync fs candidate #js {:bigint true})]
+                               ;; An fd proxy can stat as its backing directory
+                               ;; without supporting child traversal.
+                               (let [bound (.statSync fs (str candidate "/.") #js {:bigint true})]
                                  (when (and (.isDirectory bound)
                                             (= identity (stat-identity bound)))
                                    candidate))
