@@ -43,7 +43,7 @@
               ;; Discovery can become unavailable after acquisition; the
               ;; retained channel still owns the same descriptor and inode.
               (with-redefs [fs/channel-fd-int
-                            (fn [_]
+                            (fn ^long [_]
                               (throw (ex-info "Descriptor rediscovery unavailable"
                                               {:clio/error :unexpected-descriptor-scan})))]
                 (dotimes [_ 2]
