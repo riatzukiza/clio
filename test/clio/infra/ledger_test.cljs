@@ -763,6 +763,38 @@
       (finally
         (fs/remove-tree! directory)))))
 
+(deftest read-only-segment-replay-does-not-require-directory-durability
+  (let [directory (str "/tmp/clio-segments-read-only-" (host/random-uuid))
+        segments (str directory "/segments")]
+    (try
+      (fs/ensure-dir! segments)
+      (let [rt (runtime/open (str directory "/schemas") catalog)
+            revisions (:schema/revisions rt)
+            fact (event/make-event (:schema/current rt) :counter/opened
+                                   {:event/stream "counter:read-only" :event/seq 1
+                                    :event/actor "reader-test" :event/subject "counter:read-only"
+                                    :event/data {:amount 4}})
+            forces (atom 0)]
+        (ledger/create-segment! revisions segments fact)
+        (with-redefs [fs/require-directory-sync-support!
+                      (fn [_] (throw (ex-info "Unsupported platform"
+                                             {:clio/error :clio.fs/directory-sync-unavailable})))
+                      fs/sync-directory!
+                      (fn [_] (swap! forces inc)
+                        (throw (ex-info "A read-only replay attempted a directory force"
+                                        {:clio/error :unexpected-directory-force})))]
+          (is (= {:events [fact]}
+                 (try {:events (:canonical/events (ledger/canonicalize-directory revisions segments []))}
+                      (catch :default cause {:error (:clio/error (ex-data cause))}))))
+          (is (zero? @forces) "unsupported-platform replay performs no directory force"))
+        (with-redefs [fs/sync-directory!
+                      (fn [_] (throw (ex-info "Actual force failure without a wrapped cause"
+                                             {:clio/error :clio.fs/directory-sync-unavailable})))]
+          (is (= :clio.fs/directory-sync-unavailable
+                 (error-code #(ledger/canonicalize-directory revisions segments [])))
+              "a force failure after successful preflight is never swallowed")))
+      (finally (fs/remove-tree! directory)))))
+
 (deftest segment-filenames-preserve-case-variant-event-ids
   (let [directory (str "/tmp/clio-segments-case-" (host/random-uuid))
         schema-directory (str directory "/schemas")

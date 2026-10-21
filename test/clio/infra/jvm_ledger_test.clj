@@ -922,6 +922,52 @@
         (loop [n 0] (when (and (< n 100) (not= before @stuck)) (Thread/sleep 20) (recur (inc n))))
         (fs/remove-tree! directory)))))
 
+(deftest jvm-read-only-segment-replay-skips-only-unsupported-preflight
+  (with-ledger
+    (fn [{:keys [directory runtime]}]
+      (let [segments (str directory "/segments")
+            revisions (:schema/revisions runtime)
+            evt (event/make-event (:schema/current runtime) :record/observed fixture/facts)
+            forces (atom 0)]
+        (fs/ensure-dir! segments)
+        (ledger/create-segment! revisions segments evt)
+        (with-redefs [fs/require-directory-sync-support!
+                      (fn [_] (throw (ex-info "Unsupported platform"
+                                             {:clio/error :clio.fs/directory-sync-unavailable})))
+                      fs/sync-directory!
+                      (fn [_] (swap! forces inc)
+                        (throw (ex-info "Unexpected read-only force"
+                                        {:clio/error :unexpected-directory-force})))]
+          (is (= {:events [evt]}
+                 (try {:events (:canonical/events (ledger/canonicalize-directory revisions segments []))}
+                      (catch Exception cause {:error (:clio/error (ex-data cause))}))))
+          (is (zero? @forces)))
+        (with-redefs [fs/sync-directory!
+                      (fn [_] (throw (ex-info "Actual force failure without a wrapped cause"
+                                             {:clio/error :clio.fs/directory-sync-unavailable})))]
+          (is (= :clio.fs/directory-sync-unavailable
+                 (error-code #(ledger/canonicalize-directory revisions segments [])))))))))
+
+(deftest jvm-segment-lock-preserves-a-lost-claim-after-its-temp-is-unlinked
+  (with-ledger
+    (fn [{:keys [directory]}]
+      (let [temp (str directory "/creating-temp.edn")]
+        (ledger/create-ledger! temp)
+        (is (= {:result :clio.infra.ledger/claim-lost}
+               (try
+                 {:result (#'ledger/with-segment-lock
+                           fs/acquire-entry-lock! temp false (constantly nil)
+                           (fn [lock]
+                             (is (true? (fs/delete-locked-entry-if-owns! lock temp)))
+                             (is (zero? (fs/locked-link-count lock)))
+                             :clio.infra.ledger/claim-lost))}
+                 (catch Exception cause {:error (:clio/error (ex-data cause))}))))
+        (is (not (fs/exists? temp)))
+        (ledger/create-ledger! temp)
+        (let [lock (fs/acquire-entry-lock! temp)]
+          (is (some? lock) "the lost-claim path released its descriptor")
+          (fs/release-lock! lock))))))
+
 (deftest jvm-segment-lock-rechecks-link-count-before-release
   ;; A hard link added while the segment lock is held must not let the
   ;; operation succeed and acknowledge a now multiply linked segment.
