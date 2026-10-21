@@ -132,3 +132,35 @@
         (is (= original-entries (sort (fs/list-directory other)))
             "the substituted store receives neither an event nor an orphan temporary")
         (is (false? @armed?))))))
+
+(deftest pinned-parent-is-released-on-success-and-exception
+  (with-stores
+    (fn [{:keys [store]}]
+      (let [expected-path (fs/absolute-path store)]
+        (doseq [throw? [false true]]
+          (let [captured (atom nil)
+              result (outcome #(fs/with-pinned-directory!
+                                store
+                                (fn [pinned]
+                                  (reset! captured pinned)
+                                  (is (= (fs/directory-identity store)
+                                         (fs/directory-identity pinned)))
+                                  (if throw?
+                                    (throw (ex-info "Injected callback failure" {:injected true}))
+                                    :ok))))]
+          (is (= (if throw? true :ok) (if throw? (get-in result [:error :injected]) result)))
+          (is (not (fs/exists? @captured)) "the owning directory descriptor is closed")
+            (is (= expected-path (fs/absolute-path store))
+                "no retained binding changes later path resolution")))))))
+
+(deftest directory-replacement-during-pin-acquisition-is-not-adopted
+  (with-stores
+    (fn [{:keys [store swap! restore!]}]
+      (let [pin! fs/with-pinned-directory!]
+        (with-redefs [fs/with-pinned-directory!
+                      (fn [path f]
+                        (swap!)
+                        (try (pin! path f) (finally (restore!))))]
+          (is (= :clio.ledger/directory-replaced
+                 (get-in (outcome #(ledger/read-directory store [])) [:error :clio/error]))
+              "the opened parent must match the identity captured at entry"))))))

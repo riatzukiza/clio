@@ -185,6 +185,21 @@
            {:path directory}))
   directory)
 
+(defn- with-segment-directory!
+  "Hold the captured parent through every relative operation. Pathname fences
+   still reject a persistent replacement; the descriptor also defeats a
+   temporary replacement restored between those fences."
+  [directory f]
+  (let [[directory identity] (bind-segment-directory! directory)]
+    (fs/with-pinned-directory!
+      directory
+      (fn [pinned]
+        (ensure-bound-directory! pinned identity)
+        (ensure-bound-directory! directory identity)
+        (let [result (f pinned identity directory)]
+          (ensure-bound-directory! directory identity)
+          result)))))
+
 (defn- upper-char?
   [ch]
   (let [s (str ch)]
@@ -409,29 +424,26 @@
   [directory event-id]
   ;; Resolve and identity-bind the directory once, like create-segment!, so a
   ;; symlink retarget or rename+replace cannot redirect creation elsewhere.
-  (let [[directory identity] (bind-segment-directory! directory)
-        path (segment-path directory event-id)]
-    (refuse-segment-symlink! path)
-    (when-not (fs/exists? path)
-      (try
-        (create-ledger! path)
+  (with-segment-directory!
+    directory
+    (fn [directory identity logical-directory]
+      (let [path (segment-path directory event-id)]
+        (refuse-segment-symlink! path)
+        (when-not (fs/exists? path)
+          (try
+            (create-ledger! path)
+            (ensure-bound-directory! directory identity)
+            (catch #?(:clj Exception :cljs :default) cause
+              (refuse-segment-symlink! path)
+              ;; Only an already-exists race is success. A post-creation parent
+              ;; force failure stays visible even when its entry remains.
+              (if (fs/already-exists-error? cause)
+                nil
+                (throw cause)))))
+        ;; Every retry fences the same owning inode and parent before acknowledgment.
+        (with-segment-lock fs/acquire-entry-lock! path true fs/sync-locked!)
         (ensure-bound-directory! directory identity)
-        (catch #?(:clj Exception :cljs :default) cause
-          (refuse-segment-symlink! path)
-          ;; Only a concurrent creator's already-exists race is success. A
-          ;; post-creation parent sync (or any other) failure must stay visible
-          ;; even when the nondurable file entry remains.
-          (if (fs/already-exists-error? cause)
-            nil
-            (throw cause)))))
-    ;; Reflush under the entry lock on every path: a retry after a failed
-    ;; file force or parent sync must not acknowledge the same uncertain
-    ;; durability state, and a concurrent creator's entry is forced too.
-    (with-segment-lock fs/acquire-entry-lock! path true fs/sync-locked!)
-    ;; Existing-file fast path must still refuse a rename+replace of the bound
-    ;; directory; creation is the only other place that called ensure.
-    (ensure-bound-directory! directory identity)
-    path))
+        (segment-path logical-directory event-id)))))
 
 (defn- admit-locked-segment!
   [lock path event]
@@ -502,7 +514,11 @@
                           (ensure-bound-directory! directory identity)
                           :appended
                           (catch #?(:clj Exception :cljs :default) cause
-                            (fs/delete-if-exists! tmp)
+                            ;; A persistent replacement keeps the captured store's
+                            ;; in-flight state for explicit recovery, as before.
+                            (when-not (= :clio.ledger/directory-replaced
+                                         (:clio/error (ex-data cause)))
+                              (fs/delete-if-exists! tmp))
                             (cond
                               (fs/already-exists-error? cause) ::claim-lost
                               (claim-lost-to-winner? cause path) ::claim-lost
@@ -529,7 +545,8 @@
         (reclaim-unpublished-temps! directory (:event/id event))
         outcome)
       (catch #?(:clj Exception :cljs :default) cause
-        (fs/delete-if-exists! tmp)
+        (when-not (= :clio.ledger/directory-replaced (:clio/error (ex-data cause)))
+          (fs/delete-if-exists! tmp))
         (if (claim-lost-to-winner? cause path)
           ::claim-lost
           (throw cause))))))
@@ -574,36 +591,34 @@
    symlink retarget cannot split publication across two stores."
   [revisions directory event]
   (schema/validate-event! revisions event)
-  (let [[directory identity] (bind-segment-directory! directory)
-        path (segment-path directory (:event/id event))]
-    (ensure-bound-directory! directory identity)
-    (refuse-segment-symlink! path)
-    (let [outcome
-          (if (fs/exists? path)
-            ;; Do not wrap admit in a hardlink→re-admit catch: a lasting extra
-            ;; link already failed closed inside admit; retrying only doubles wait.
-            (admit-existing-segment! path event)
-            (do (ensure-bound-directory! directory identity)
-                (let [published
-                      (try
-                        (publish-new-segment! directory path event identity)
-                        (catch #?(:clj Exception :cljs :default) cause
-                          ;; A concurrent winner may still hold a second link in
-                          ;; the publish window. When the final name exists, admit
-                          ;; against it instead of surfacing a transient hardlink.
-                          (if (and (= :clio.ledger/segment-hardlink
-                                      (:clio/error (ex-data cause)))
-                                   (fs/exists? path))
-                            ::claim-lost
-                            (throw cause))))]
-                  (if (= ::claim-lost published)
-                    (admit-existing-segment! path event)
-                    published))))]
-      ;; publish-new-segment! already sweeps after a fresh claim; retries that
-      ;; find the final name still clear any leftover creating temps.
-      (ensure-bound-directory! directory identity)
-      (reclaim-unpublished-temps! directory (:event/id event))
-      outcome)))
+  (with-segment-directory!
+    directory
+    (fn [directory identity _logical-directory]
+      (let [path (segment-path directory (:event/id event))]
+        (ensure-bound-directory! directory identity)
+        (refuse-segment-symlink! path)
+        (let [outcome
+              (if (fs/exists? path)
+                ;; Admit already retries a transient extra link; do not double its wait.
+                (admit-existing-segment! path event)
+                (do (ensure-bound-directory! directory identity)
+                    (let [published
+                          (try
+                            (publish-new-segment! directory path event identity)
+                            (catch #?(:clj Exception :cljs :default) cause
+                              ;; A winner can still hold its temporary second link.
+                              (if (and (= :clio.ledger/segment-hardlink
+                                          (:clio/error (ex-data cause)))
+                                       (fs/exists? path))
+                                ::claim-lost
+                                (throw cause))))]
+                      (if (= ::claim-lost published)
+                        (admit-existing-segment! path event)
+                        published))))]
+          ;; Retries clear stale temporaries just as a fresh publish does.
+          (ensure-bound-directory! directory identity)
+          (reclaim-unpublished-temps! directory (:event/id event))
+          outcome)))))
 
 (defn- read-segment!
   "Capture one segment snapshot through a no-follow shared lock and validate it
@@ -644,40 +659,39 @@
    legacy ledger) and of every segment in `directory`. Each segment snapshot is
    validated for the one-event-per-`<event-id>.edn` format and is the exact
    value returned; callers canonicalize these snapshots without rereading.
-   The directory identity bound at entry is rechecked before every segment open
-   and at the final fence so a rename+replace cannot feed snapshots from a
-   replacement store."
+   Enumeration, segment opens and stale-alias repair stay relative to an owning
+   parent descriptor. Logical pathname fences additionally reject a persistent
+   replacement, without trusting pathname checks to defeat a temporary ABA."
   [directory extra-paths]
-  (let [[directory identity] (bind-segment-directory! directory)
-        _ (ensure-bound-directory! directory identity)
-        paths (segment-paths directory)
-        _ (ensure-bound-directory! directory identity)
-        extra (read-ledgers extra-paths)
-        snapshots (into extra
-                        (map (fn [path]
-                               (ensure-bound-directory! directory identity)
-                               (read-segment! path)))
-                        paths)]
-    ;; Stale-alias repair may have unlinked a publish temp whose directory
-    ;; force failed; a retry no longer sees that alias, so fence the bound
-    ;; segment directory once before returning any snapshot.
-    (ensure-bound-directory! directory identity)
-    (when (and (seq paths)
-               (try
-                 (fs/require-directory-sync-support! directory)
-                 true
-                 (catch #?(:clj Exception :cljs :default) cause
-                   ;; Read-only replay is supported without directory durability.
-                   ;; Only the unsupported preflight is optional; failures of the
-                   ;; actual force below must always propagate, even without a
-                   ;; nested cause.
-                   (if (and (= :clio.fs/directory-sync-unavailable
-                               (:clio/error (ex-data cause)))
-                            (nil? (ex-cause cause)))
-                     false
-                     (throw cause)))))
-      (fs/sync-directory! directory))
-    snapshots))
+  (with-segment-directory!
+    directory
+    (fn [directory identity logical-directory]
+      (let [_ (ensure-bound-directory! logical-directory identity)
+            paths (segment-paths directory)
+            _ (ensure-bound-directory! directory identity)
+            extra (read-ledgers extra-paths)
+            snapshots (into extra
+                            (map (fn [path]
+                                   (ensure-bound-directory! logical-directory identity)
+                                   (read-segment! path)))
+                            paths)]
+        ;; A stale alias may already have disappeared before its force failed.
+        ;; Fence the owning parent before returning another snapshot on retry.
+        (ensure-bound-directory! logical-directory identity)
+        (when (and (seq paths)
+                   (try
+                     (fs/require-directory-sync-support! directory)
+                     true
+                     (catch #?(:clj Exception :cljs :default) cause
+                       ;; Only an unsupported preflight is optional for replay.
+                       ;; Every actual force failure below still propagates.
+                       (if (and (= :clio.fs/directory-sync-unavailable
+                                   (:clio/error (ex-data cause)))
+                                (nil? (ex-cause cause)))
+                         false
+                         (throw cause)))))
+          (fs/sync-directory! directory))
+        snapshots))))
 
 (defn canonicalize-directory
   "Canonicalize the extra ledger files together with every segment in

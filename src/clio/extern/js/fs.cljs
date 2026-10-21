@@ -4,6 +4,8 @@
             ["node:fs" :as fs]
             ["node:path" :as node-path]))
 
+(def ^:private pinned-directories (atom {}))
+
 (defn exists?
   [path]
   (boolean (fs/existsSync path)))
@@ -35,7 +37,11 @@
   [path]
   ;; Node's JavaScript realpath implementation normalizes '..' before walking
   ;; links. The native resolver follows the same filesystem semantics as open.
-  (.native ^js (.-realpathSync fs) path))
+  ;; A library-owned descriptor path must keep its kernel binding. Resolving
+  ;; it back to a pathname would reintroduce parent-directory ABA.
+  (if (contains? @pinned-directories path)
+    path
+    (.native ^js (.-realpathSync fs) path)))
 
 (defn absolute-lexical-path
   "Make `path` absolute against the process working directory without requiring
@@ -57,7 +63,10 @@
   "True when `path` still names the directory identity captured earlier."
   [path identity]
   (try
-    (= (directory-identity path) identity)
+    (and (= (directory-identity path) identity)
+         (if-let [logical (get @pinned-directories path)]
+           (= (directory-identity logical) identity)
+           true))
     (catch :default _ false)))
 
 (defn missing-path-error? [cause]
@@ -131,6 +140,42 @@
 
 (defn- stat-identity [^js stat]
   [(str (.-dev stat)) (str (.-ino stat))])
+
+(defn- display-entry-path [path]
+  (if-let [directory (get @pinned-directories (.dirname node-path path))]
+    (.join node-path directory (.basename node-path path))
+    path))
+
+(defn with-pinned-directory!
+  "Call f with a directory path anchored to an owning read-only descriptor.
+   Capability-probe descriptor namespaces rather than falling back to a
+   replaceable pathname. The path is valid only during f; all paths opened
+   below it keep the captured parent, including while it is renamed."
+  [path f]
+  (let [fd (.openSync fs path (bit-or (.-O_RDONLY (.-constants fs))
+                                    (.-O_DIRECTORY (.-constants fs))))]
+    (try
+      (let [st (.fstatSync fs fd #js {:bigint true})
+            _ (when-not (.isDirectory st)
+                (throw (ex-info "Path is not a directory"
+                                {:path path :clio/error :clio.fs/not-directory})))
+            identity (stat-identity st)
+            pinned (some (fn [root]
+                           (let [candidate (str root "/" fd)]
+                             (try
+                               (let [bound (.statSync fs candidate #js {:bigint true})]
+                                 (when (and (.isDirectory bound)
+                                            (= identity (stat-identity bound)))
+                                   candidate))
+                               (catch :default _ nil))))
+                         ["/proc/self/fd" "/dev/fd"])]
+        (when-not pinned
+          (throw (ex-info "Host cannot bind segment operations to a directory descriptor"
+                          {:path path :clio/error :clio.fs/directory-binding-unavailable})))
+        (swap! pinned-directories assoc pinned path)
+        (try (f pinned)
+             (finally (swap! pinned-directories dissoc pinned))))
+      (finally (.closeSync fs fd)))))
 
 (defn- refuse-locked-path! [path]
   (when (and (seq @locked-paths)
@@ -361,7 +406,7 @@
         (repair-stale-aliases! target-path fd stale-aliases))
       (when nofollow? (refuse-multiply-linked-fd! path fd))
       (swap! locked-paths assoc target-path (stat-identity (fs/fstatSync fd #js {:bigint true})))
-      {:lock/path path :lock/target-path target-path :lock/fd fd}
+      {:lock/path (display-entry-path path) :lock/target-path target-path :lock/fd fd}
       (catch :default cause
         (fs/closeSync fd)
         (throw cause)))))

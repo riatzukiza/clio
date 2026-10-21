@@ -315,6 +315,25 @@ entry the process cannot write falls back to a READ open bounded by
 `clio.extern.jvm.fs/*entry-open-timeout-ms*`; it fails closed with
 `:clio.fs/entry-open-blocked`, and while `*max-stuck-entry-opens*` abandoned
 opens are still blocked, further fallback opens refuse immediately.
+
+Segment directory operations also retain an owning parent descriptor through
+enumeration, entry opens, publication, stale-temp repair and directory forces.
+Resolving that descriptor back to a pathname would lose the binding, so the
+adapters keep the descriptor namespace until the operation finishes and close
+it on success or failure. Temporary rename/replace/restore cannot substitute a
+different store's valid events or redirect a write. A persistent replacement
+still refuses acknowledgment and retains in-flight publication state for
+recovery. `ensure-segment-file!` continues to return its ordinary logical path.
+
+Directory binding and directory durability are separate capabilities. The
+Node adapter probes `/proc/self/fd` and `/dev/fd`; without a usable descriptor
+namespace it refuses with `:clio.fs/directory-binding-unavailable`, never a
+pathname-only fallback. The JVM uses its existing Linux descriptor discovery.
+Read-only replay skips an unsupported directory-force preflight, but real
+force failures still propagate. Ordinary single-file replay is unchanged.
+The directory-binding tests run on Linux under JVM, NBB and compiled CLJS;
+native macOS/Windows directory binding is not qualified by those results.
+
 The Node adapter resynchronizes existing ancestry on retry, including directories
 left present by a previously refused force. Tests observe real filesystem calls,
 inject file and directory synchronization failures, and verify that no dependent

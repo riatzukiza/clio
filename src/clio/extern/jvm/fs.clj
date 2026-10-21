@@ -14,6 +14,7 @@
 (def ^:private no-attributes (make-array FileAttribute 0))
 (def ^:private ^ReentrantLock process-guard (ReentrantLock. true))
 (def ^:private active-locks (atom {}))
+(def ^:private pinned-directories (atom {}))
 
 (defn- nio-path ^Path [path]
   (Paths/get ^String path (make-array String 0)))
@@ -21,7 +22,9 @@
 (defn absolute-path
   "Resolve the existing target through the filesystem, preserving link/.. semantics."
   [path]
-  (str (.toRealPath (nio-path path) no-links)))
+  (if (contains? @pinned-directories path)
+    path
+    (str (.toRealPath (nio-path path) no-links))))
 
 (defn absolute-lexical-path
   "Make `path` absolute against the process working directory without requiring
@@ -45,7 +48,10 @@
   "True when `path` still names the directory identity captured earlier."
   [path identity]
   (try
-    (= (directory-identity path) identity)
+    (and (= (directory-identity path) identity)
+         (if-let [logical (get @pinned-directories path)]
+           (= (directory-identity logical) identity)
+           true))
     (catch Exception _ false)))
 
 (defn missing-path-error? [cause]
@@ -139,6 +145,27 @@
                            :matches (count matches)}))))
       (finally
         (.position channel (long saved))))))
+
+(defn with-pinned-directory!
+  "Call f with a path anchored to an owning read-only directory channel.
+   Uses the same descriptor discovery as segment-entry locks; unsupported
+   binding fails closed instead of resolving back to a replaceable pathname.
+   The descriptor path is valid only within f and is closed on every outcome."
+  [path f]
+  (with-open [channel (FileChannel/open (nio-path path)
+                                      (into-array OpenOption [StandardOpenOption/READ]))]
+    (let [fd (channel-fd-int channel)
+          pinned (str "/proc/self/fd/" fd)]
+      (directory-identity pinned)
+      (swap! pinned-directories assoc pinned path)
+      (try (f pinned)
+           (finally (swap! pinned-directories dissoc pinned))))))
+
+(defn- display-entry-path [path]
+  (let [p (nio-path path)]
+    (if-let [directory (get @pinned-directories (str (.getParent p)))]
+      (str (.resolve (nio-path directory) (.getFileName p)))
+      path)))
 
 (defn- fd-file-key
   "Identity of the inode owned by descriptor `fd`, via Linux `/proc/self/fd/<n>`.
@@ -310,7 +337,7 @@
    a no-follow open binds to the directory entry itself."
   [path]
   (let [p (.toAbsolutePath (nio-path path))]
-    (str (.resolve (.toRealPath (.getParent p) no-links) (.getFileName p)))))
+    (str (.resolve (nio-path (absolute-path (str (.getParent p)))) (.getFileName p)))))
 
 (defn- symlink-entry-error? [^Throwable cause]
   ;; Linux reports O_NOFOLLOW on a symlink as ELOOP.
@@ -509,8 +536,8 @@
                                  :clio/error :clio.fs/multiply-linked-entry})))))
           (swap! active-locks assoc token
                  {:channel channel :file-lock lock :file/key key
-                  :path path :target-path target-path :read-only? (boolean read-only?)})
-          {:lock/id token :lock/path path})
+                  :path (display-entry-path path) :target-path target-path :read-only? (boolean read-only?)})
+          {:lock/id token :lock/path (display-entry-path path)})
         (catch Throwable cause
           (.close channel)
           (throw cause))))

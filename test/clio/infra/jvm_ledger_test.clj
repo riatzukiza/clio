@@ -431,7 +431,14 @@
   (let [file-key @#'fs/file-key]
     (with-redefs [fs/file-key (fn
                                 ([p] (file-key p))
-                                ([p links] (file-key (if (= p entry) decoy p) links)))]
+                                ([p links]
+                                 ;; Parent descriptor paths have the same checked
+                                 ;; basename. Do not fake the opened file's separate
+                                 ;; /proc/self/fd/<n> identity check.
+                                 (file-key (if (= (last (str/split p #"/"))
+                                                  (last (str/split entry #"/")))
+                                             decoy p)
+                                           links)))]
       (f))))
 
 (deftest jvm-fifo-swapped-in-after-the-entry-check-fails-closed
@@ -531,9 +538,15 @@
             sync! fs/sync-directory!]
         (fs/ensure-dir! segments)
         (is (= :appended (ledger/create-segment! revisions segments evt)))
-        (with-redefs [fs/sync-directory! (fn [p] (swap! synced conj p) (sync! p))]
-          (is (= [evt] (:canonical/events (ledger/canonicalize-directory revisions segments [])))))
-        (is (some #(= (fs/absolute-path segments) %) @synced))))))
+        (let [expected (fs/directory-identity segments)]
+          (with-redefs [fs/sync-directory!
+                        (fn [p]
+                          ;; Observe the actual directory while its descriptor is
+                          ;; open, rather than comparing an ephemeral alias later.
+                          (swap! synced conj (fs/directory-identity p))
+                          (sync! p))]
+            (is (= [evt] (:canonical/events (ledger/canonicalize-directory revisions segments [])))))
+          (is (some #(= expected %) @synced)))))))
 
 (deftest jvm-hard-link-added-while-publishing-is-refused
   (with-ledger
