@@ -2,6 +2,7 @@
   (:require [clio.domain.canonicalize-test]
             [clio.domain.schema-test]
             [clio.infra.directory-binding-test]
+            [clio.infra.file-guard-test]
             [clio.infra.jvm-durability-retry-test]
             [clio.infra.jvm-ledger-test]
             [clio.law.ledger-test]
@@ -15,6 +16,7 @@
         (test/run-tests 'clio.domain.canonicalize-test
                         'clio.domain.schema-test
                         'clio.infra.directory-binding-test
+                        'clio.infra.file-guard-test
                         'clio.infra.jvm-durability-retry-test
                         'clio.infra.jvm-ledger-test
                         'clio.law.ledger-test

@@ -7,6 +7,7 @@
             [clio.extern.js.process :as process]
             [clio.infra.cli-test]
             [clio.infra.directory-binding-test]
+            [clio.infra.file-guard-test]
             [clio.infra.kernel-lock-test]
             [clio.infra.ledger-test]
             [clio.infra.node-durability-test]
@@ -27,6 +28,7 @@
  'clio.lint-extern-boundary-test
  'clio.infra.cli-test
  'clio.infra.directory-binding-test
+                        'clio.infra.file-guard-test
  'clio.infra.kernel-lock-test
  'clio.infra.ledger-test
  'clio.infra.node-durability-test
