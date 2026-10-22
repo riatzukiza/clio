@@ -1,0 +1,40 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+name: eta-mu evidence review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  review:
+    if: ${{ github.event.pull_request.draft == false && github.event.pull_request.head.repo.full_name == github.repository }}
+    name: Evidence-first review (eta-mu)
+    uses: open-hax/eta-mu/.github/workflows/opencode-code-review.yml@45ec644c2d15ed511e9bc1e797d1b4073b63dbfc
+    with:
+      pr_head_sha: ${{ github.event.pull_request.head.sha }}
+      model: opencode/mimo-v2.6-flash-free
+      muse_revision: 0b9a91492c8355e6933dc2164d35668cb76d9e60
+      agents_revision: 4b4f48dae1b804b2581974e604cca618ecedadf1
+      opencode_version: 1.18.31
+      node_version: "22.20.0"
+      setup_eta_mu_toolchain: true
+      evidence_gates_script: |
+        run_gate diff_stat git diff --stat "${PR_BASE_SHA}...HEAD"
+        run_gate diff_hygiene git diff --check "${PR_BASE_SHA}...HEAD"
+        run_gate install pnpm install --frozen-lockfile
+        install_status="$(awk -F= '$1 == "install" {print $2}' "$statuses")"
+        if [[ "$install_status" == "0" ]]; then
+          run_gate lint pnpm lint
+          run_gate test pnpm test
+        else
+          echo "lint=125" >> "$statuses"
+          echo "test=125" >> "$statuses"
+          echo "Dependency installation failed; lint and test were not attempted." >> "$log"
+        fi
+    secrets:
+      ETA_MU_APP_ID: ${{ secrets.ETA_MU_APP_ID }}
+      ETA_MU_APP_PRIVATE_KEY: ${{ secrets.ETA_MU_APP_PRIVATE_KEY }}
