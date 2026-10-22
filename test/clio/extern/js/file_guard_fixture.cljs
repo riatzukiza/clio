@@ -1,5 +1,6 @@
 (ns clio.extern.js.file-guard-fixture
-  (:require ["node:fs" :as module-fs]
+  (:require [clio.extern.js.fs :as fs]
+            ["node:fs" :as module-fs]
             ["node:module" :refer [syncBuiltinESMExports]]))
 
 (def ^:private native (or (.-default module-fs) module-fs))
@@ -24,3 +25,11 @@
     (syncBuiltinESMExports)
     (try {:value (operation) :swapped? @swapped}
          (finally (set! (.-openSync native) open) (syncBuiltinESMExports)))))
+
+(def unavailable-code :clio.fs/file-identity-unavailable)
+(defn with-unavailable-identity! [operation]
+  (with-redefs [fs/locked-file-identity
+                (fn [_]
+                  (throw (ex-info "Injected descriptor identity refusal"
+                                  {:clio/error :clio.fs/file-identity-unavailable})))]
+    (operation)))

@@ -103,9 +103,33 @@
     (fn [{:keys [path runtime]}]
       (let [reads (atom 0) read! fs/read-locked-text]
         (with-redefs [fs/read-locked-text (fn [lock] (swap! reads inc) (read! lock))]
-          (doseq [[options code] [[[] :clio.fs/invalid-file-guard-options]
+          (doseq [[options code] [[{} :clio.fs/missing-file-identity]
+                                  [[] :clio.fs/invalid-file-guard-options]
                                   [1 :clio.fs/invalid-file-guard-options]
                                   [{:expected-file-identities nil} :clio.fs/invalid-file-guard-options]
                                   [{:expected-file-identities {path nil}} :clio.fs/invalid-file-identity]]]
             (is (= code (:error (outcome #(runtime/canonicalize-files runtime [path] options)))))))
         (is (zero? @reads))))))
+
+(deftest guarded-public-descriptor-identity-and-unsupported-capability-cleanup
+  (with-store
+    (fn [{:keys [path identity]}]
+      (doseq [acquire! [fs/acquire-read-lock! fs/acquire-lock!]]
+        (let [lock (acquire! path {:expected-file-identity identity})]
+          (try (is (= identity (fs/locked-file-identity lock)))
+               (is (every? string? (fs/locked-file-identity lock)))
+               (finally (fs/release-lock! lock))))
+        (let [result (fixture/with-unavailable-identity!
+                       #(outcome (fn [] (acquire! path {:expected-file-identity identity}))))]
+          ;; A failed injection must still release an unexpected returned token.
+          (when-let [lock (:value result)] (fs/release-lock! lock))
+          (is (= fixture/unavailable-code (:error result))))
+        (let [lock (acquire! path)] (fs/release-lock! lock)))
+      (is (= "" (fs/read-text path))))))
+
+(deftest explicit-empty-single-file-guard-cannot-downgrade-to-default-arity
+  (with-store
+    (fn [{:keys [path runtime]}]
+      (let [result (outcome #(runtime/append! runtime path :record/observed facts/facts {}))]
+        (is (= :clio.fs/missing-file-identity (:error result)) (pr-str result))
+        (is (= "" (fs/read-text path)))))))

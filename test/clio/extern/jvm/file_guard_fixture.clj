@@ -26,3 +26,11 @@
                                       (let [fd (discover channel)] (restore!) fd))]
       (try {:value (operation) :swapped? @swapped}
            (finally (restore!))))))
+
+(def unavailable-code :clio.fs/channel-identity-unavailable)
+(defn with-unavailable-identity! [operation]
+  (with-redefs [fs/channel-fd-int
+                (fn ^long [_]
+                  (throw (ex-info "Injected descriptor discovery refusal"
+                                  {:clio/error :clio.fs/channel-identity-unavailable})))]
+    (operation)))
