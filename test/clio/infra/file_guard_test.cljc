@@ -97,3 +97,15 @@
                (:error (outcome #(runtime/append! runtime path :record/observed facts/facts
                                                   {:expected-file-identity identity}))))))
       (is (= "" (fs/read-text path))))))
+
+(deftest malformed-canonical-guard-options-never-downgrade-to-an-unguarded-read
+  (with-store
+    (fn [{:keys [path runtime]}]
+      (let [reads (atom 0) read! fs/read-locked-text]
+        (with-redefs [fs/read-locked-text (fn [lock] (swap! reads inc) (read! lock))]
+          (doseq [[options code] [[[] :clio.fs/invalid-file-guard-options]
+                                  [1 :clio.fs/invalid-file-guard-options]
+                                  [{:expected-file-identities nil} :clio.fs/invalid-file-guard-options]
+                                  [{:expected-file-identities {path nil}} :clio.fs/invalid-file-identity]]]
+            (is (= code (:error (outcome #(runtime/canonicalize-files runtime [path] options)))))))
+        (is (zero? @reads))))))
