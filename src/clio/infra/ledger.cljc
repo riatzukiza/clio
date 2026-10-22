@@ -4,6 +4,7 @@
             #?(:clj [clio.extern.jvm.fs :as fs]
                :cljs [clio.extern.js.fs :as fs])
             [clio.law.event :as event-law]
+            [clio.law.file-guard :as file-guard]
             [clio.law.ledger :as ledger-law]
             [clio.shape.edn :as edn]
             [clojure.string :as str]))
@@ -15,6 +16,11 @@
 (defn create-ledger!
   [path]
   (fs/create-exclusive! path))
+
+(defn- guarded-lock!
+  [acquire! path options]
+  (file-guard/validate-options! options)
+  (if (some? options) (acquire! path options) (acquire! path)))
 
 (defn- parse-ledger-text
   [path text]
@@ -35,18 +41,23 @@
 
 (defn- read-existing-ledger!
   "Capture and parse one complete immutable snapshot through its owning descriptor."
-  [path]
-  (let [lock (fs/acquire-read-lock! path)]
+  ([path] (read-existing-ledger! path nil))
+  ([path options]
+  (let [lock (guarded-lock! fs/acquire-read-lock! path options)]
     (try
       (parse-ledger-text path (fs/read-locked-text lock))
-      (finally (fs/release-lock! lock)))))
+      (finally (fs/release-lock! lock))))))
 
 (defn read-ledger
   "Inspect one ledger under its writer lock; an absent optional ledger remains empty."
-  [path]
+  ([path] (read-ledger path nil))
+  ([path options]
+  (file-guard/validate-options! options)
   (if-not (fs/exists? path)
-    []
-    (read-existing-ledger! path)))
+    (if (some? options)
+      (fail! :clio.ledger/missing-file "Ledger file does not exist" {:path path})
+      [])
+    (read-existing-ledger! path options))))
 
 (defn- append-record!
   [lock existing-text event]
@@ -73,9 +84,10 @@
    the ledger inode. Exact retries are idempotent. Causal parents may live in
    other physical ledger files; complete-history causality is checked when
    ledgers are unioned."
-  [revisions path event]
+  ([revisions path event] (append-event! revisions path event nil))
+  ([revisions path event options]
   (require-ledger-path! path)
-  (let [lock (fs/acquire-lock! path)]
+  (let [lock (guarded-lock! fs/acquire-lock! path options)]
     (try
       (schema/validate-event! revisions event)
       (let [existing-text (fs/read-locked-text lock)
@@ -105,41 +117,46 @@
               (append-record! lock existing-text event)
               :appended))))
       (finally
-        (fs/release-lock! lock)))))
+        (fs/release-lock! lock))))))
 
 (defn ensure-durable-with!
   "Read under the owning lock, then load revisions, validate and reflush before release.
    Loading after capture admits concurrently published schemas without weakening
    validation. The loader must be synchronous and must not acquire this ledger lock."
-  [load-revisions path]
+  ([load-revisions path] (ensure-durable-with! load-revisions path nil))
+  ([load-revisions path options]
   (require-ledger-path! path)
-  (let [lock (fs/acquire-lock! path)]
+  (let [lock (guarded-lock! fs/acquire-lock! path options)]
     (try
       (let [events (parse-ledger-text path (fs/read-locked-text lock))
             revisions (load-revisions)]
         (doseq [existing events]
           (schema/validate-event! revisions existing)))
       (fs/sync-locked! lock)
-      (finally (fs/release-lock! lock)))))
+      (finally (fs/release-lock! lock))))))
 
 (defn ensure-durable!
   "Validate and reflush an existing ledger against explicitly supplied revisions.
    Visible history can contain a creation or append whose synchronization failed. The
    owning lock remains held through validation and the new durability fence."
-  [revisions path]
-  (ensure-durable-with! (fn [] revisions) path))
+  ([revisions path] (ensure-durable! revisions path nil))
+  ([revisions path options]
+  (ensure-durable-with! (fn [] revisions) path options)))
 
 (defn read-ledgers
   "Capture complete per-file snapshots under the same inode locks used by writers.
    Pure validation/union consumes these immutable values after releasing each lock;
    this does not imply one atomic transaction across separate partition files."
-  [paths]
+  ([paths] (read-ledgers paths nil))
+  ([paths options]
+  (file-guard/validate-read-options! options)
   (doseq [path paths] (require-ledger-path! path))
-  (mapv read-existing-ledger! paths))
+  (mapv (fn [path] (read-existing-ledger! path (file-guard/for-path options path))) paths)))
 
 (defn canonicalize-files
-  [revisions paths]
-  (canonicalize/canonicalize revisions (read-ledgers paths)))
+  ([revisions paths] (canonicalize-files revisions paths nil))
+  ([revisions paths options]
+  (canonicalize/canonicalize revisions (read-ledgers paths options))))
 
 ;; Segment directories: one immutable ledger file per event. Physical
 ;; partitioning carries no semantic authority (law 6), so a directory of

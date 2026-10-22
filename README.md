@@ -543,3 +543,61 @@ package-local CI receipt file.
 ## License
 
 GNU LGPL v3 or later.
+
+
+## Guarded monolithic file identity
+
+An installed consumer can require an exact file identity for each read or
+append. The guard compares the **descriptor under the owning kernel lock**,
+before reading ledger content or appending; it does not trust a pathname stat
+performed before open. Identities are Clojure vectors of exact decimal device
+and inode strings, such as `["2049" "123456"]`. Host descriptors, channels,
+BigInts and file-key objects remain inside the extern adapter.
+
+Both filesystem adapters expose `locked-file-identity` while a lock is held.
+`acquire-lock!` and `acquire-read-lock!` accept an optional second argument
+`{:expected-file-identity identity}`. Capture the installed identity through a
+trusted initialization boundary; an identity supplied by untrusted request data
+does not establish which file the installation intended to use.
+
+Single-file ledger operations accept optional final options with that same
+key: `read-ledger`, `append-event!`, `ensure-durable!` and
+`ensure-durable-with!`. Runtime calls propagate it without changing event,
+catalog or recovery data:
+
+```clojure
+(def guard {:expected-file-identity installed-identity})
+(runtime/append! rt path :counter/opened facts guard)
+(runtime/retry-append! rt preserved-recovery guard)
+(runtime/ensure-durable! rt path guard)
+```
+
+Canonical reads declare an identity for **every requested path**:
+
+```clojure
+(runtime/canonicalize-files
+ rt [path alias]
+ {:expected-file-identities {path installed-identity
+                             alias installed-identity}})
+```
+
+`ledger/read-ledgers` and `ledger/canonicalize-files` accept the same final
+per-path options. Non-nil options require an explicit guard key: `{}` is not an unguarded
+fallback. Missing declarations, malformed identities, unsupported
+identity capabilities and mismatches refuse visibly. A mismatch releases the
+newly acquired lock without reading or appending ledger bytes. Same-inode
+hard-link aliases remain valid. Old arities retain unguarded behavior.
+
+Guarded identity observation uses Node's actual `fstat` and the JVM channel's
+actual descriptor through Linux `/proc`; a guarded JVM operation refuses if
+that descriptor capability is unavailable. This adds no pathname-only fallback.
+Segment recovery with a monolithic identity guard is explicitly unsupported;
+segment publication remains a different per-event-ID protocol, not global
+stream-slot arbitration.
+
+The guard binds an operation to the expected open inode. It does not guarantee
+that another actor cannot later rename, unlink or replace its pathname, provide
+a transaction across files, or authenticate a persistence volume/deployment.
+The existing append fsync and target-parent durability fences still apply.
+An exact retry remains `:already-present`, and a recovery result does not confer
+permission for an external effect.

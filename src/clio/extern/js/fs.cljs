@@ -1,6 +1,7 @@
 (ns clio.extern.js.fs
   (:refer-clojure :exclude [exists?])
-  (:require ["fs-ext-extra-prebuilt" :as fs-ext]
+  (:require [clio.law.file-guard :as file-guard]
+            ["fs-ext-extra-prebuilt" :as fs-ext]
             ["node:fs" :as fs]
             ["node:path" :as node-path]))
 
@@ -140,6 +141,18 @@
 
 (defn- stat-identity [^js stat]
   [(str (.-dev stat)) (str (.-ino stat))])
+
+(defn locked-file-identity
+  "Decode the actual owning descriptor as exact device/inode decimal strings."
+  [{:lock/keys [fd path]}]
+  (let [stat (try (fs/fstatSync fd #js {:bigint true})
+                  (catch :default cause
+                    (throw (ex-info "Descriptor identity is unavailable"
+                                    {:path path :clio/error :clio.fs/file-identity-unavailable} cause))))]
+    (when-not (.isFile stat)
+      (throw (ex-info "Opened ledger is not a regular file"
+                      {:path path :clio/error :clio.fs/not-regular-file})))
+    (stat-identity stat)))
 
 (defn- display-entry-path [path]
   (if-let [directory (get @pinned-directories (.dirname node-path path))]
@@ -391,7 +404,9 @@
     (when (seq aliases) (sync-directory! (parent-path target-path)))))
 
 (defn- acquire-lock-mode!
-  [path read-only? nofollow? {:keys [stale-aliases]}]
+  [path read-only? nofollow? {:keys [stale-aliases expected-file-identity] :as options}]
+  (when (contains? options :expected-file-identity)
+    (file-guard/validate-identity! expected-file-identity))
   ;; Bind the resolved target before opening it: a later symlink retarget must
   ;; not move the parent fence away from the inode owned by this descriptor.
   ;; A no-follow open instead binds the named entry and refuses a symlink there.
@@ -404,6 +419,13 @@
         fd (open-entry! target-path flags nofollow? path)]
     (try
       (acquire-native-lock! fd read-only?)
+      (when (contains? options :expected-file-identity)
+        (let [actual (locked-file-identity {:lock/fd fd :lock/path path})]
+          (when-not (= expected-file-identity actual)
+            (throw (ex-info "Locked descriptor does not match expected file identity"
+                            {:path path :clio/error :clio.fs/file-identity-mismatch
+                             :expected-file-identity expected-file-identity
+                             :actual-file-identity actual})))))
       (when (and nofollow? stale-aliases (< 1 (.-nlink (fs/fstatSync fd))))
         (repair-stale-aliases! target-path fd stale-aliases))
       (when nofollow? (refuse-multiply-linked-fd! path fd))
@@ -435,8 +457,9 @@
    imply O_CREAT, which would let a misspelled or deleted ledger be created
    here and appended to as an empty history. create-ledger! is the only
    creation path; an absent ledger fails with ENOENT."
-  [path]
-  (acquire-lock-mode! path false false nil))
+  ([path] (acquire-lock-mode! path false false nil))
+  ([path options] (file-guard/validate-options! options)
+   (acquire-lock-mode! path false false options)))
 
 (defn acquire-read-lock!
   "Open an existing ledger read-only and hold a shared lock against exclusive writers.
@@ -444,8 +467,9 @@
    Unix uses shared flock plus an authoritative whole-file POSIX read lock;
    Windows uses shared LockFileEx. The same inode guard, owning-descriptor read
    and release operation apply. This never creates storage or upgrades access."
-  [path]
-  (acquire-lock-mode! path true false nil))
+  ([path] (acquire-lock-mode! path true false nil))
+  ([path options] (file-guard/validate-options! options)
+   (acquire-lock-mode! path true false options)))
 
 (defn acquire-entry-lock!
   "Like acquire-lock!, but open the directory entry with O_NOFOLLOW so the

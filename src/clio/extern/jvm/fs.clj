@@ -1,6 +1,7 @@
 (ns clio.extern.jvm.fs
   (:refer-clojure :exclude [exists?])
-  (:require [clojure.string :as str])
+  (:require [clojure.string :as str]
+            [clio.law.file-guard :as file-guard])
   (:import [java.nio ByteBuffer]
            [java.nio.channels FileChannel FileLock]
            [java.nio.charset StandardCharsets]
@@ -175,6 +176,17 @@
    substitute inode."
   [fd]
   (file-key (str "/proc/self/fd/" fd) no-links))
+
+(defn- fd-file-identity
+  [fd path]
+  (try
+    (let [p (str "/proc/self/fd/" fd)]
+      (file-key p)
+      [(Long/toUnsignedString (long (Files/getAttribute (nio-path p) "unix:dev" no-links)))
+       (Long/toUnsignedString (long (Files/getAttribute (nio-path p) "unix:ino" no-links)))])
+    (catch Exception cause
+      (throw (ex-info "Descriptor identity is unavailable"
+                      {:path path :clio/error :clio.fs/file-identity-unavailable} cause)))))
 
 (defn- fd-link-count
   [fd path]
@@ -460,7 +472,9 @@
         (throw cause)))))
 
 (defn- acquire-lock-mode!
-  [path read-only? nofollow? {:keys [stale-aliases]}]
+  [path read-only? nofollow? {:keys [stale-aliases expected-file-identity] :as options}]
+  (when (contains? options :expected-file-identity)
+    (file-guard/validate-identity! expected-file-identity))
   (.lock process-guard)
   (try
     ;; Resolve before opening so a later symlink retarget cannot redirect the
@@ -477,10 +491,10 @@
           _ (when (some #(= key (:file/key %)) (vals @active-locks))
               (throw (ex-info "Path is locked by this process; use the owning descriptor"
                               {:path target-path :clio/error :clio.fs/locked-path-read})))
-          options (cond-> (if read-only? [StandardOpenOption/READ]
+          channel-options (cond-> (if read-only? [StandardOpenOption/READ]
                               [StandardOpenOption/READ StandardOpenOption/WRITE])
                     nofollow? (conj LinkOption/NOFOLLOW_LINKS))
-          open-options ^"[Ljava.nio.file.OpenOption;" (into-array OpenOption options)
+          open-options ^"[Ljava.nio.file.OpenOption;" (into-array OpenOption channel-options)
           channel (try (if (and nofollow? read-only?)
                          ;; Read-only opens are the ones a FIFO swap can block.
                          (open-entry-read! target-path path)
@@ -495,12 +509,12 @@
           ;; open while this channel still owns a substitute inode;
           ;; /proc/self/fd reports the descriptor's identity. Ordinary
           ;; (link-following) ledger locks keep their pre-segment behavior.
-          fd (when nofollow?
+          fd (when (or nofollow? (contains? options :expected-file-identity))
                (try (channel-fd-int channel)
                     (catch Exception cause
                       (.close channel)
                       (throw cause))))
-          opened-key (when nofollow?
+          opened-key (when (or nofollow? (contains? options :expected-file-identity))
                        (try (fd-file-key fd)
                             (catch Exception cause
                               (.close channel)
@@ -512,6 +526,13 @@
       (try
         (let [lock (.lock channel 0 Long/MAX_VALUE (boolean read-only?))
               token (str (UUID/randomUUID))]
+          (when (contains? options :expected-file-identity)
+            (let [actual (fd-file-identity fd path)]
+              (when-not (= expected-file-identity actual)
+                (throw (ex-info "Locked descriptor does not match expected file identity"
+                                {:path path :clio/error :clio.fs/file-identity-mismatch
+                                 :expected-file-identity expected-file-identity
+                                 :actual-file-identity actual})))))
           (when nofollow?
             ;; Link-count and stale-alias repair describe the opened inode.
             (when-not (= key (fd-file-key fd))
@@ -535,7 +556,7 @@
                                  :nlink nlink
                                  :clio/error :clio.fs/multiply-linked-entry})))))
           (swap! active-locks assoc token
-                 {:channel channel :file-lock lock :file/key key :fd fd
+                 {:channel channel :file-lock lock :file/key (or opened-key key) :fd fd
                   :path (display-entry-path path) :target-path target-path :read-only? (boolean read-only?)})
           {:lock/id token :lock/path (display-entry-path path)})
         (catch Throwable cause
@@ -554,16 +575,18 @@
    the process's existing POSIX lock. This deliberately serializes local JVM
    ledger operations; separate processes still coordinate per inode in the OS.
    The returned Clojure token carries no host channel or lock object."
-  [path]
-  (acquire-lock-mode! path false false nil))
+  ([path] (acquire-lock-mode! path false false nil))
+  ([path options] (file-guard/validate-options! options)
+   (acquire-lock-mode! path false false options)))
 
 (defn acquire-read-lock!
   "Hold a shared whole-file lock using a genuinely read-only FileChannel.
 
    Shared readers conflict with Clio's exclusive POSIX writers. They retain the
    same local inode guard and release path, and cannot create or append files."
-  [path]
-  (acquire-lock-mode! path true false nil))
+  ([path] (acquire-lock-mode! path true false nil))
+  ([path options] (file-guard/validate-options! options)
+   (acquire-lock-mode! path true false options)))
 
 (defn acquire-entry-lock!
   "Like acquire-lock!, but open the directory entry with NOFOLLOW_LINKS so the
@@ -633,6 +656,12 @@
   (or (get @active-locks (:lock/id token))
       (throw (ex-info "Ledger lock token is not active"
                       {:clio/error :clio.fs/inactive-lock}))))
+
+(defn locked-file-identity
+  "Decode the owning FileChannel descriptor without exposing host handles."
+  [token]
+  (let [{:keys [^FileChannel channel path fd]} (lock-entry token)]
+    (fd-file-identity (or fd (channel-fd-int channel)) path)))
 
 (defn read-locked-text
   "Read only through the descriptor that owns the inode lock."

@@ -9,6 +9,7 @@
             [clio.infra.ledger :as ledger]
             [clio.infra.schema-store :as schema-store]
             [clio.law.append :as append-law]
+            [clio.law.file-guard :as file-guard]
             [clojure.string :as str]))
 
 (defn open
@@ -32,39 +33,51 @@
   "Capture complete locked snapshots before loading their published schema revisions.
    Schema files are immutable and precede the events that reference them; refreshing
    after capture avoids mixing newer events with an earlier revision inventory."
-  [runtime paths]
-  (let [snapshots (ledger/read-ledgers paths)
+  ([runtime paths] (canonicalize-files runtime paths nil))
+  ([runtime paths options]
+  (file-guard/validate-read-options! options)
+  (let [snapshots (if (some? options) (ledger/read-ledgers paths options) (ledger/read-ledgers paths))
         revisions (:schema/revisions (refresh runtime))]
-    (canonicalize/canonicalize revisions snapshots)))
+    (canonicalize/canonicalize revisions snapshots))))
 
 (defn ensure-durable!
   "Refresh schema revisions under the existing ledger's durability lock."
-  [runtime path]
-  (ledger/ensure-durable-with! #(:schema/revisions (refresh runtime)) path))
+  ([runtime path] (ensure-durable! runtime path nil))
+  ([runtime path options]
+  (file-guard/validate-options! options)
+  (if (some? options)
+    (ledger/ensure-durable-with! #(:schema/revisions (refresh runtime)) path options)
+    (ledger/ensure-durable-with! #(:schema/revisions (refresh runtime)) path))))
 
 (defn retry-append!
   "Explicitly retry a preserved candidate without generating identity or time.
    Exact visible events still require validated inode and parent durability."
-  [runtime recovery]
+  ([runtime recovery] (retry-append! runtime recovery nil))
+  ([runtime recovery options]
+  (file-guard/validate-options! options)
   (append-law/validate-recovery! recovery)
   (try
     (let [runtime (refresh runtime)
           {:ledger/keys [path segment-directory] :keys [event]} recovery
           revisions (:schema/revisions runtime)]
       {:append/result (if segment-directory
-                        (do (when-not (= path (ledger/segment-path segment-directory (:event/id event)))
+                        (do (when (some? options)
+                              (throw (ex-info "Descriptor guards require a monolithic ledger"
+                                              {:clio/error :clio.fs/unsupported-file-guard})))
+                            (when-not (= path (ledger/segment-path segment-directory (:event/id event)))
                               (throw (ex-info "Segment recovery must name the event's own segment"
                                               {:clio/error :clio.runtime/invalid-append-recovery
                                                :ledger/path path
                                                :ledger/segment-directory segment-directory})))
                             (ledger/create-segment! revisions segment-directory event))
-                        (ledger/append-event! revisions path event))
+                        (if (some? options) (ledger/append-event! revisions path event options)
+                            (ledger/append-event! revisions path event)))
        :event event
        :runtime runtime})
     (catch #?(:clj Exception :cljs :default) cause
       (throw (ex-info (ex-message cause)
                       (assoc (ex-data cause) :clio/append-recovery recovery)
-                      cause)))))
+                      cause))))))
 
 (defn- recovery-path [path]
   (try (fs/absolute-path path)
@@ -77,10 +90,13 @@
 (defn append!
   "Create and append an event. Admission/persistence failures expose the exact
    candidate in exception data under :clio/append-recovery for explicit retry."
-  [runtime ledger-file schema-id event-data]
+  ([runtime ledger-file schema-id event-data] (append! runtime ledger-file schema-id event-data nil))
+  ([runtime ledger-file schema-id event-data options]
+  (file-guard/validate-options! options)
   (retry-append! runtime
                  {:ledger/path (recovery-path ledger-file)
-                  :event (event/make-event (:schema/current runtime) schema-id event-data)}))
+                  :event (event/make-event (:schema/current runtime) schema-id event-data)}
+                 options)))
 
 (defn canonicalize-directory
   "Canonicalize extra ledger files plus every segment in `directory`. Segment
