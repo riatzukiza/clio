@@ -151,6 +151,14 @@
          (canonical/canonical-edn 1.5)))
   (is (= "[:number :real 1 \"7205759403792794\" -56]"
          (canonical/canonical-edn 0.1)))
+  (is (= [1 "7205759403792794" -56] (canonical/finite-real-components 0.1)))
+  (is (= 0.1 (canonical/compose-real 1 "7205759403792794" -56)))
+  (is (= -2.75 (canonical/compose-real -1 "6192449487634432" -51)))
+  (doseq [value [0.0 -0.0 1.0 -1.0 0.1 -0.1 1.5 1e-7
+                 1.7976931348623157e308 5e-324]]
+    (let [[sign digits exponent] (canonical/finite-real-components value)]
+      (is (= value (canonical/compose-real sign digits exponent))
+          (str "IEEE-754 components round-trip " value))))
   (is (= "[:number :real 1 \"7555786372591432\" -76]"
          (canonical/canonical-edn 1e-7)))
   (is (= "[:number :real -1 \"6192449487634432\" -51]"

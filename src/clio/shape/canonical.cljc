@@ -93,6 +93,50 @@
         (< m two52) (recur (* m 2) (dec e))
         :else {:sign (if negative? -1 1) :mantissa m :exponent e}))))
 
+(defn finite-real-components
+  "Sign, decimal mantissa, and binary exponent of one finite double.
+
+   `value = sign × mantissa × 2^exponent`, mantissa an integer in
+   `[2^52, 2^53)` written without leading zeros, or `[1 \"0\" 0]` when the
+   value is zero. `-0.0` uses that zero triple because `(= -0.0 0.0)` holds
+   on both hosts and zero has no decomposition. Non-finite values are refused."
+  [value]
+  (let [d (double value)]
+    (when-not (finite? d)
+      (non-portable! value))
+    (if (zero? d)
+      [1 "0" 0]
+      (let [{:keys [sign mantissa exponent]} (real-decomposition d)]
+        [sign (integer-digits mantissa) exponent]))))
+
+(defn compose-real
+  "Inverse of `finite-real-components`.
+
+   Halving and doubling are the same exact IEEE-754 steps the decomposition
+   undoes. A triple that does not come back as itself is not a finite double
+   we can name, and is refused instead of being rounded to a neighbor."
+  [sign digits exponent]
+  (when-not (and (#{1 -1} sign)
+                 (string? digits)
+                 (re-matches #"0|[1-9][0-9]*" digits)
+                 (integer? exponent))
+    (non-portable! {:sign sign :digits digits :exponent exponent}))
+  (let [parsed (when-not (= digits "0") (parse-long digits))
+        magnitude (if (= digits "0")
+                    0.0
+                    (if (nil? parsed)
+                      (non-portable! {:sign sign :digits digits :exponent exponent})
+                      (loop [m (double parsed) e exponent]
+                        (cond
+                          (pos? e) (recur (* m 2.0) (dec e))
+                          (neg? e) (recur (/ m 2.0) (inc e))
+                          :else m))))
+        value (if (neg? sign) (- magnitude) magnitude)]
+    (when-not (and (finite? value)
+                   (= (finite-real-components value) [sign digits exponent]))
+      (non-portable! {:sign sign :digits digits :exponent exponent}))
+    value))
+
 (defn- canonical-real
   "Encode a finite shared real number by its exact IEEE-754 decomposition
    rather than its decimal string, because decimal rendering is host-decided.
@@ -101,13 +145,8 @@
    infinity into the normalization loop. -0.0 canonicalizes to +0.0 because
    (= -0.0 0.0) holds on both runtimes and zero has no decomposition."
   [value]
-  (let [d (double value)]
-    (when-not (finite? d)
-      (non-portable! value))
-    (if (zero? d)
-      [:number :real 1 "0" 0]
-      (let [{:keys [sign mantissa exponent]} (real-decomposition d)]
-        [:number :real sign (integer-digits mantissa) exponent]))))
+  (let [[sign digits exponent] (finite-real-components value)]
+    [:number :real sign digits exponent]))
 
 (defn- canonical-number
   [value]
