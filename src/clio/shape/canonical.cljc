@@ -116,10 +116,16 @@
    undoes. A triple that does not come back as itself is not a finite double
    we can name, and is refused instead of being rounded to a neighbor."
   [sign digits exponent]
+  ;; A binary64 value is `mantissa × 2^exponent` with mantissa in
+  ;; [2^52, 2^53). That puts exponent in [-1126, 971]: the smallest
+  ;; subnormal is 2^52 × 2^-1126 and the largest finite double is
+  ;; (2^53-1) × 2^971. Anything outside cannot round-trip, and the
+  ;; reconstruction loop would otherwise run once per unit of exponent.
   (when-not (and (#{1 -1} sign)
                  (string? digits)
                  (re-matches #"0|[1-9][0-9]*" digits)
-                 (integer? exponent))
+                 (integer? exponent)
+                 (<= -1126 exponent 971))
     (non-portable! {:sign sign :digits digits :exponent exponent}))
   (let [parsed (when-not (= digits "0") (parse-long digits))
         magnitude (if (= digits "0")

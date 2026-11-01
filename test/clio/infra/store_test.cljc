@@ -86,13 +86,16 @@
             again (store/append store twin)
             clash (store/append store (assoc (dissoc twin :event/hash) :event/data {:changed true}))
             slot (store/append store rival)
-            bad (store/append store wrong)]
+            bad (store/append store wrong)
+            zero-seq (store/append store (assoc (dissoc twin :event/hash) :event/seq 0))]
         (try
           (is (= :already-present (:admission/verdict again)) name)
           (is (= :id-collision (:admission/verdict clash)) name)
           (is (= :stream-slot-conflict (:admission/verdict slot)) name)
           (is (= :rejected (:admission/verdict bad)) name)
           (is (= :clio.ledger/event-hash-mismatch (:admission/reason bad)) name)
+          (is (= :rejected (:admission/verdict zero-seq)) name)
+          (is (= :clio.ledger/invalid-identity (:admission/reason zero-seq)) name)
           (is (= (domain/export-events events) (store/all-events store)) name)
           (finally
             (store/release store)))))))

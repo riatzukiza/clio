@@ -112,7 +112,10 @@
          (error #(json/decode ["set" [["integer" "1"] ["integer" "1"]]]))))
   (is (= :clio.json/invalid-tag (error #(json/decode ["nope"]))))
   (is (= :clio.json/invalid-tag (error #(json/decode ["integer" "01"]))))
-  (is (= :clio.json/invalid-tag (error #(json/decode ["uuid" "AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE"])))))
+  (is (= :clio.json/invalid-tag (error #(json/decode ["uuid" "AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE"]))))
+  (is (= :clio.canonical/non-portable-number
+         (error #(json/decode ["real" 1 "4503599627370496" 9007199254740991])))
+      "an exponent outside binary64 must be refused before reconstruction"))
 
 (defrecord SampleBox [x])
 

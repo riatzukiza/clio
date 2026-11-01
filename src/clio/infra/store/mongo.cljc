@@ -54,7 +54,10 @@
 (defrecord MongoStore [handle drop-on-release?]
   store/LedgerStore
   (append [this event]
-    (let [admission (domain/admit (conflicts handle event) event sha256)]
+    (let [precheck (domain/admit [] event sha256)
+          admission (if (= :rejected (:admission/verdict precheck))
+                      precheck
+                      (domain/admit (conflicts handle event) event sha256))]
       (if-not (= :appendable (:admission/verdict admission))
         (store/verdict admission this)
         (try

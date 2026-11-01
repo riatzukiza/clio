@@ -167,9 +167,11 @@ complete carrier value is refused (`:clio.json/invalid-text`), including a
 float, an object, an integer outside the safe range, and any trailing
 characters. The reader does not return a prefix.
 
-`real` uses `finite-real-components` / `compose-real`. A component triple that
-does not reproduce itself is refused, not rounded to a neighbor. Zero,
-including `-0.0`, is the triple `[1, "0", 0]` because `(= -0.0 0.0)`.
+`real` uses `finite-real-components` / `compose-real`. The exponent is an
+integer in `[-1126, 971]`, the range of that decomposition for a finite
+binary64 value. A triple outside that range, or one that does not reproduce
+itself, is refused before reconstruction, not rounded and not looped over.
+Zero, including `-0.0`, is the triple `[1, "0", 0]` because `(= -0.0 0.0)`.
 
 Sequential values that are not vectors are encoded as `vector`. Clojure `=`
 compares sequential collections by contents, so a list round-trips under `=`.

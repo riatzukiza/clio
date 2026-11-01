@@ -87,6 +87,15 @@
                   "memory -> mongo -> jsonl equals memory -> jsonl")
               (finally
                 (release-all [origin filled mid end direct-target via direct]))))
+          (let [store ((get make :mongo))
+                twin (second events)
+                refused (store/append store (assoc (dissoc twin :event/hash) :event/seq 0))]
+            (try
+              (is (= :rejected (:admission/verdict refused)))
+              (is (= :clio.ledger/invalid-identity (:admission/reason refused))
+                  "a non-positive sequence is an identity refusal, not a driver error")
+              (finally
+                (store/release store))))
           (finally
             (fs/remove-tree! dir))))
       (do
