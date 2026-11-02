@@ -303,6 +303,30 @@ union -> historical-schema validation -> UUID dedupe
 The returned DAG preserves parent/child relationships separately from the replay
 vector so callers do not have to infer causality from vector adjacency.
 
+## Ledger stores
+
+A ledger is a family of streams. Adapters implement `clio.infra.store/LedgerStore`:
+`append`, `read-range`, `streams`, `head-hash` and `release`. `transfer` copies
+one store onto another in stream-major order. The admission verdict is
+`clio.law.ledger/append-admission`, after the optional envelope and the content
+hash are checked. `:event/hash` is the SHA-256 of the canonical EDN of the event
+with that key removed, so the digest is not an input to itself. Events that do
+not carry the new keys stay valid.
+
+EDN-lines is the newline-delimited `pr-str` format this file already describes.
+JSONL and MongoDB store the same events as tagged JSON (`clio.shape.json`):
+keywords, namespaced keys, sets, instants, UUIDs and the canonical number
+domain round-trip, and a non-portable value is refused rather than narrowed.
+The MongoDB index stores `:event/seq` as an int64 and refuses a sequence that
+does not fit. The JVM driver is an optional test/alias dependency
+(`org.mongodb/mongodb-driver-sync`); the Node driver is the `mongodb` package,
+loaded when a store is opened. Either host skips the transfer suite when the
+driver or the server is absent.
+
+The objects, morphisms and laws are in [docs/ledger-store-model.md](docs/ledger-store-model.md).
+Sqlite, DuckDB, Postgres, Redis, Elasticsearch and OpenSearch are the same
+protocol and are not implemented here.
+
 ## CLI
 
 Installed from npm, the entrypoint is `clio`; inside this repository it is

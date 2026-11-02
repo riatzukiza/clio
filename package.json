@@ -29,6 +29,7 @@
     "clean": "rm -rf target .nbb"
   },
   "devDependencies": {
+    "mongodb": "6.12.0",
     "shadow-cljs": "3.4.11"
   }
 }
