@@ -49,9 +49,22 @@
           {:uri uri})
       {:skipped (:skipped opened) :message (:message opened)})))
 
+(deftest a-driver-failure-is-not-a-skip
+  (is (not (mongo/skippable-open? :clio.mongo/driver)))
+  (is (mongo/skippable-open? :clio.mongo/unavailable))
+  (is (mongo/skippable-open? :clio.mongo/driver-missing)))
+
 (deftest mongo-transfer-pairs
-  (let [probed (probe)]
-    (if-let [uri (:uri probed)]
+  (let [configured (mongo/configured-uri)
+        probed (probe)]
+    (cond
+      (and configured (:skipped probed))
+      (is false
+          (str "Configured Mongo endpoint failed qualification: "
+               (:skipped probed) " " (:message probed)))
+
+      :else
+      (if-let [uri (:uri probed)]
       (let [dir (str "/tmp/clio-mongo-" (runtime/random-uuid))
             _ (fs/ensure-dir! dir)
             n (atom 0)
@@ -103,4 +116,4 @@
                  (pr-str (:skipped probed))
                  (:message probed))
         (is (#{:clio.mongo/unavailable :clio.mongo/driver-missing} (:skipped probed))
-            "an absent MongoDB driver or server skips transfer instead of failing")))))
+            "an absent MongoDB driver or server skips transfer instead of failing"))))))

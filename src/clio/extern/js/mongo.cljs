@@ -3,9 +3,13 @@
 
    The driver is async and is loaded only when a store is opened. It runs
    on a worker thread; the caller waits with Atomics so `append` stays a
-   plain function, matching the file adapters. The worker is the only place
-   that touches the driver. Missing driver and unreachable servers are
-   refusals, not empty ledgers."
+   plain function, matching the file adapters. That wait blocks the calling
+   thread (up to 8 seconds on boot, 20 seconds per command). Do not call it
+   from a request-serving event loop; a service that shares that loop needs
+   its own async boundary. The worker is the only place that touches the
+   driver. A missing driver or an unreachable server is a skippable refusal.
+   A driver or setup failure (authentication, index creation, configuration)
+   is not, and is not rewritten into 'server absent'."
   (:require ["node:path" :as node-path]
             ["node:worker_threads" :as worker-threads]
             [clojure.string :as str]))
@@ -158,6 +162,18 @@
 (defn- decode-text [bytes n]
   (.decode (js/TextDecoder. "utf-8") (.subarray bytes 16 (+ 16 n))))
 
+(defn failure-error
+  "Error class for a worker body `{:err _ :message _}`.
+
+   `:driver` is a broken setup. It is not an absent server, and open must
+   not report it as one."
+  [body]
+  (case (:err body)
+    "driver-missing" :clio.mongo/driver-missing
+    "unavailable" :clio.mongo/unavailable
+    "duplicate" :clio.mongo/duplicate
+    :clio.mongo/driver))
+
 (defn- read-response [header bytes]
   (js->clj (.parse js/JSON (decode-text bytes (.load js/Atomics header 1)))
            :keywordize-keys true))
@@ -171,9 +187,7 @@
           (= cur 9)
           (let [body (try (read-response header bytes) (catch :default _ {}))]
             (throw (ex-info (or (:message body) "MongoDB worker failed")
-                            {:clio/error (case (:err body)
-                                           "driver-missing" :clio.mongo/driver-missing
-                                           :clio.mongo/unavailable)
+                            {:clio/error (failure-error body)
                              :mongo/detail body})))
           :else
           (let [remaining (- deadline (js/Date.now))]
@@ -190,7 +204,7 @@
         len (encode-text bytes payload)]
     (when-not (= 0 (.load js/Atomics header 0))
       (throw (ex-info "MongoDB worker is not idle"
-                      {:clio/error :clio.mongo/unavailable})))
+                      {:clio/error :clio.mongo/driver})))
     (.store js/Atomics header 1 len)
     (.store js/Atomics header 0 1)
     (.notify js/Atomics header 0 1)

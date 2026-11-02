@@ -41,8 +41,11 @@
                            :event event)))))
 
 (defn transfer
-  "`F_target ∘ F_source⁻¹`. Events are appended in export order. A refusal
-   throws and the target is left with the events accepted before it."
+  "`F_target ∘ F_source⁻¹`. Events are appended one at a time, in export
+   order. This is not a transaction: a refusal throws and the target keeps
+   the events already accepted. A caller that must commit several events
+   together needs a store-specific transaction or its own envelope; this
+   protocol does not provide one."
   [source target]
   (reduce (fn [target event]
             (accepted (append target event) event))

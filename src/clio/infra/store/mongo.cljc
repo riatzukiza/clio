@@ -103,14 +103,20 @@
                                   :collection collection})
                   (boolean (:drop-on-release? opts)))))
 
+(defn skippable-open?
+  "True only for an optional server or driver that is not there.
+   A setup failure (`:clio.mongo/driver`) is not skippable."
+  [code]
+  (contains? #{:clio.mongo/unavailable :clio.mongo/driver-missing} code))
+
 (defn connect
-  "Like `open`, but an absent driver or server is `{:skipped code :message _}`
-   instead of an exception. Any other failure still throws."
+  "Like `open`, but an absent driver or server is `{:skipped code :message _}`.
+   Authentication, index, and other setup failures still throw."
   [opts]
   (try
     {:store (open opts)}
     (catch #?(:clj Exception :cljs :default) cause
       (let [code (:clio/error (ex-data cause))]
-        (if (#{:clio.mongo/unavailable :clio.mongo/driver-missing} code)
+        (if (skippable-open? code)
           {:skipped code :message (ex-message cause)}
           (throw cause))))))

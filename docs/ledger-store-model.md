@@ -201,8 +201,27 @@ F_s⁻¹ : Store_s → Ledger
 T_{s→t} = F_t ∘ F_s⁻¹
 ```
 
-`transfer` is `T`. It appends in export order. A verdict other than `:appended`
-or `:already-present` aborts the transfer.
+`transfer` is `T`. It appends in export order, one event at a time. A verdict
+other than `:appended` or `:already-present` aborts the transfer. The events
+already accepted stay. `append` is not a multi-event commit, and neither is
+`import-ledger` or `import-jsonl`.
+
+**Commit boundary.** There is no batch transaction in this protocol. A caller
+that must recover a decision, a receipt, and an outbox as one committed
+operation cannot get that by calling `append` three times, and this protocol
+will not grow a second store interface to imply it. That caller uses a
+transaction the specific store already has, or its own committed-operation
+envelope, qualified on its own. Head-hash equality is equality of the stream
+family. It is not an authorization decision and it is not a proof that
+`:event/causes` resolve inside the ledger. Causal closure stays in
+`canonicalize`.
+
+**Node MongoDB blocking.** The Node adapter waits on `Atomics.wait` in the
+calling thread, up to 8 seconds while the worker boots and up to 20 seconds
+per command. It must not run on a request-serving event loop. A process that
+shares that loop has to put its own asynchronous boundary in front of this
+adapter. This repository does not provide that boundary, and a store-return
+test is not a liveness probe for the surrounding service.
 
 **Projection.** `clio.domain.projection/state` is `foldl step`. For a pure
 `step`,

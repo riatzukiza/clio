@@ -6,6 +6,7 @@
             [clio.domain.event-hash-test]
             [clio.domain.schema-test]
             [clio.domain.store-test]
+            [clio.extern.js.mongo-failure-test]
             [clio.extern.js.process :as process]
             [clio.infra.cli-test]
             [clio.infra.mongo-store-test]
@@ -34,6 +35,7 @@
  'clio.law.envelope-test
  'clio.law.ledger-test
  'clio.lint-extern-boundary-test
+ 'clio.extern.js.mongo-failure-test
  'clio.infra.cli-test
  'clio.infra.mongo-store-test
  'clio.infra.store-test
