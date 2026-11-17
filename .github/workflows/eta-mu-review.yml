@@ -13,7 +13,7 @@ jobs:
   review:
     if: ${{ github.event.pull_request.draft == false && github.event.pull_request.head.repo.full_name == github.repository }}
     name: Evidence-first review (eta-mu)
-    uses: open-hax/eta-mu/.github/workflows/opencode-code-review.yml@45ec644c2d15ed511e9bc1e797d1b4073b63dbfc
+    uses: open-hax/eta-mu/.github/workflows/opencode-code-review.yml@40058f43f47e9f793210803f185159cd81999986
     with:
       pr_head_sha: ${{ github.event.pull_request.head.sha }}
       model: opencode/mimo-v2.6-flash-free
